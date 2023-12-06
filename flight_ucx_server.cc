@@ -23,6 +23,7 @@
 #include "arrow/util/string.h"
 #include "arrow/util/thread_pool.h"
 #include "arrow/util/uri.h"
+#include "arrow/gpu/cuda_api.h"
 
 namespace arrow {
 using internal::ToChars;
@@ -250,6 +251,10 @@ void UcxServer::WorkerLoop(ucp_conn_request_h request) {
       return;
     }
   }
+
+  auto mgr = cuda::CudaDeviceManager::Instance().ValueOrDie();
+  auto context = mgr->GetContext(0).ValueOrDie();
+  cuCtxPushCurrent(reinterpret_cast<CUcontext>(context->handle()));
 
   while (listening_.load()) {
     ucp_worker_progress(worker->worker_->get());

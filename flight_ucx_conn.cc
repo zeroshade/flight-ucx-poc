@@ -140,16 +140,18 @@ Status Connection::SendAM(unsigned int id, const void* data, const int64_t size)
 Status Connection::SendAMIov(unsigned int id, const void* header,
                              const size_t header_length, const ucp_dt_iov_t* iov,
                              const size_t iov_cnt, void* user_data,
-                             ucp_send_nbx_callback_t cb) {
+                             ucp_send_nbx_callback_t cb, const ucs_memory_type_t memory_type) {
   RETURN_NOT_OK(CheckClosed());
 
   ucp_request_param_t request_param;
   request_param.op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS | UCP_OP_ATTR_FIELD_DATATYPE |
-                               UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA;
-  request_param.flags = UCP_AM_SEND_FLAG_COPY_HEADER | UCP_AM_SEND_FLAG_REPLY;
+                               UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA |
+                               UCP_OP_ATTR_FIELD_MEMORY_TYPE;
+  request_param.flags = UCP_AM_SEND_FLAG_COPY_HEADER | UCP_AM_SEND_FLAG_REPLY | UCP_AM_SEND_FLAG_RNDV;
   request_param.datatype = UCP_DATATYPE_IOV;
   request_param.cb.send = cb;
-  request_param.user_data = user_data;
+  request_param.user_data = user_data;  
+  request_param.memory_type = memory_type;
 
   void* request = ucp_am_send_nbx(remote_endpoint_, id, header, header_length, iov,
                                   iov_cnt, &request_param);

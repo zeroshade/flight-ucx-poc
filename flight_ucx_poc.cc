@@ -28,6 +28,7 @@
 #include "arrow/buffer.h"
 #include "arrow/flight/client.h"
 #include "arrow/flight/server.h"
+#include "arrow/gpu/cuda_api.h"
 #include "arrow/ipc/test_common.h"
 #include "arrow/status.h"
 #include "arrow/util/logging.h"
@@ -44,16 +45,28 @@ const std::shared_ptr<Schema> test_schema =
                      field("f6", int64()), field("f7", uint64())});
 
 namespace ucx {
+
+static constexpr char kCPUData[] = "ticket-ints-cpu";
+static constexpr char kGPUData[] = "ticket-ints-gpu";
+
 class UcxStreamReader {
  public:
   explicit UcxStreamReader(Connection* cnxn)
       : cnxn_(cnxn), ipc_options_(ipc::IpcReadOptions::Defaults()) {}
 
+  void set_memory_mgr(std::shared_ptr<MemoryManager> mm) {
+    if (!mm) {
+      rndv_mem_mgr_ = CPUDevice::Instance()->default_memory_manager();
+    } else {
+      rndv_mem_mgr_ = std::move(mm);
+    }
+  }
+
   Status SetHandlers() {
     ucp_am_handler_param_t params;
     params.field_mask = UCP_AM_HANDLER_PARAM_FIELD_ARG | UCP_AM_HANDLER_PARAM_FIELD_ID |
                         UCP_AM_HANDLER_PARAM_FIELD_CB | UCP_AM_HANDLER_PARAM_FIELD_FLAGS;
-    params.flags = UCP_AM_FLAG_WHOLE_MSG | UCP_AM_FLAG_PERSISTENT_DATA;
+    // params.flags = UCP_AM_FLAG_PERSISTENT_DATA;
     params.arg = this;
     params.id = static_cast<unsigned int>(ipc::MessageType::SCHEMA);
     params.cb = RecvSchemaMsg;
@@ -72,11 +85,23 @@ class UcxStreamReader {
 
   arrow::Result<std::shared_ptr<Schema>> GetSchema() {
     std::thread([this] {
-      while (!finished_.load()) {
+      if (arrow::cuda::IsCudaMemoryManager(*rndv_mem_mgr_)) {
+        auto ctx = *(*arrow::cuda::AsCudaMemoryManager(rndv_mem_mgr_))
+                        ->cuda_device()
+                        ->GetContext();
+        cuCtxPushCurrent(reinterpret_cast<CUcontext>(ctx->handle()));
+      }
+      while (true) {
         if (cnxn_->MakeProgress()) {
           cv_progress_.notify_all();
         }
-      }
+        if (finished_.load()) {
+          std::lock_guard lock(stream_lock_);
+          if (queue_.empty() && outstanding_rndv_.load() == 0) {
+            break;
+          }
+        }
+      }      
     }).detach();
 
     std::unique_lock<std::mutex> lock(stream_lock_);
@@ -90,21 +115,32 @@ class UcxStreamReader {
   }
 
   arrow::Result<std::shared_ptr<RecordBatch>> ReadNext() {
-    std::unique_lock<std::mutex> lock(stream_lock_);
-    if (queue_.empty()) {
-      if (finished_.load()) {
-        return Status::Cancelled("completed");
+    std::future<processed_rb> out;
+    {
+      std::unique_lock<std::mutex> lock(stream_lock_);
+      if (queue_.empty()) {
+        if (finished_.load()) {
+          return Status::Cancelled("completed");
+        }
+
+        cv_progress_.wait(lock, [this] { return !queue_.empty() || finished_.load(); });
       }
 
-      cv_progress_.wait(lock, [this] { return !queue_.empty() && !finished_.load(); });
+      out = std::move(queue_.front());
+      queue_.pop();
     }
-
-    auto out = std::move(queue_.front());
-    queue_.pop();
-    return out;
+    return out.get();
   }
 
  protected:
+  using processed_rb = arrow::Result<std::shared_ptr<RecordBatch>>;
+  struct PendingDataRecv {
+    std::promise<processed_rb> promise;
+    std::shared_ptr<Buffer> metadata;
+    std::unique_ptr<Buffer> buffer;
+    UcxStreamReader* rdr;
+  };
+
   static ucs_status_t RecvSchemaMsg(void* arg, const void* header, size_t header_length,
                                     void* data, size_t length,
                                     const ucp_am_recv_param_t* param) {
@@ -128,26 +164,70 @@ class UcxStreamReader {
     // TODO: check memory type and build buffers based on the memory type
     // so we can try passing data direct from GPU to GPU and avoid copies
 
+    std::promise<processed_rb> promise;
+    auto metadata =
+        std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(header), header_length);
     if (param->recv_attr & UCP_AM_RECV_ATTR_FLAG_DATA) {
-      auto metadata = std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(header),
-                                               header_length);
       // UcxDataBuffer will free the data later, returning UCS_INPROGRESS
       // maintains the lifetime after the callback returns.
       auto body = std::make_shared<UcxDataBuffer>(rdr->cnxn_->worker(), data, length);
       // scatter gather IOV returns the buffers here as a single contiguous chunk
       // of data, which is perfect for processing IPC
-      // could we get better performance by memh? is there a better way we should be doing this?
+      // could we get better performance by memh? is there a better way we should be doing
+      // this?
       auto msg = *ipc::Message::Open(metadata, body);
-      auto rec = ipc::ReadRecordBatch(*msg, rdr->schema_, &rdr->dictionary_memo_, rdr->ipc_options_);      
-      rdr->queue_.push(std::move(rec));
+      auto rec = ipc::ReadRecordBatch(*msg, rdr->schema_, &rdr->dictionary_memo_,
+                                      rdr->ipc_options_);
+      rdr->queue_.push(promise.get_future());
+      promise.set_value(std::move(rec));
       return UCS_INPROGRESS;
     }
 
     if (param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) {
+      rdr->queue_.push(promise.get_future());
+
       // handle rndv protocol
+      auto maybe_buffer = rdr->rndv_mem_mgr_->AllocateBuffer(length);
+      if (!maybe_buffer.ok()) {
+        ARROW_LOG(WARNING) << "failed mem mgr AllocateBuffer(" << length
+                           << "):" << maybe_buffer.status().ToString();
+        return UCS_ERR_NO_MEMORY;
+      }
+
+      PendingDataRecv* pending_recv = new PendingDataRecv{
+          std::move(promise), std::move(metadata), maybe_buffer.MoveValueUnsafe(), rdr};
+      void* dest = reinterpret_cast<void*>(pending_recv->buffer->address());
+
+      ucp_request_param_t recv_param;
+      recv_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+                                UCP_OP_ATTR_FIELD_MEMORY_TYPE |
+                                UCP_OP_ATTR_FIELD_USER_DATA;
+      recv_param.memory_type =
+          (pending_recv->buffer->is_cpu()) ? UCS_MEMORY_TYPE_HOST : UCS_MEMORY_TYPE_CUDA;
+      recv_param.cb.recv_am = RecvAMDataCB;
+      recv_param.user_data = reinterpret_cast<void*>(pending_recv);
+
+      void* request = ucp_am_recv_data_nbx(rdr->cnxn_->worker()->get(), data, dest,
+                                           length, &recv_param);
+      if (UCS_PTR_IS_ERR(request)) {
+        ucs_status_t st = UCS_PTR_STATUS(request);
+        pending_recv->promise.set_value(FromUcsStatus("ucp_am_recv_data_nbx", st));
+        delete pending_recv;
+        return st;
+      } else if (!request) {
+        auto msg =
+            *ipc::Message::Open(pending_recv->metadata, std::move(pending_recv->buffer));
+        auto rec = ipc::ReadRecordBatch(*msg, rdr->schema_, &rdr->dictionary_memo_,
+                                        rdr->ipc_options_);
+        pending_recv->promise.set_value(std::move(rec));
+        delete pending_recv;
+      }
+      ++rdr->outstanding_rndv_;
+
+      return UCS_OK;
     }
 
-    // handle 
+    // handle
 
     return UCS_ERR_IO_ERROR;
   }
@@ -161,25 +241,54 @@ class UcxStreamReader {
     return UCS_OK;
   }
 
+  static void RecvAMDataCB(void* request, ucs_status_t status, size_t length,
+                           void* user_data) {
+    PendingDataRecv* pending_recv = reinterpret_cast<PendingDataRecv*>(user_data);
+    ucp_request_free(request);
+    if (status != UCS_OK) {
+      pending_recv->promise.set_value(
+          FromUcsStatus("ucp_am_recv_data_nbx (callback)", status));
+      delete pending_recv;
+    }
+
+    auto msg =
+        *ipc::Message::Open(pending_recv->metadata, std::move(pending_recv->buffer));
+    auto rec = ipc::ReadRecordBatch(*msg, pending_recv->rdr->schema_,
+                                    &pending_recv->rdr->dictionary_memo_,
+                                    pending_recv->rdr->ipc_options_);
+    pending_recv->promise.set_value(std::move(rec));
+    delete pending_recv;
+    --pending_recv->rdr->outstanding_rndv_;
+  }
+
  private:
   Connection* cnxn_;
   std::atomic<bool> finished_{false};
   std::condition_variable cv_progress_;
   std::mutex stream_lock_;
-  std::atomic<int64_t> counter_{0};
-  std::queue<arrow::Result<std::shared_ptr<RecordBatch>>> queue_;
+  std::atomic<int64_t> outstanding_rndv_{0};
+  std::queue<std::future<processed_rb>> queue_;
 
   ipc::IpcReadOptions ipc_options_;
-  
-  std::shared_ptr<Schema> schema_;    
+
+  std::shared_ptr<Schema> schema_;
   ipc::DictionaryMemo dictionary_memo_;
   bool swap_endian_;
+
+  std::shared_ptr<MemoryManager> rndv_mem_mgr_{
+      CPUDevice::Instance()->default_memory_manager()};
 };
 
 class UcxStreamWriter {
  public:
   explicit UcxStreamWriter(Connection* cnxn)
-      : cnxn_(cnxn), ipc_options_(ipc::IpcWriteOptions::Defaults()) {}
+      : cnxn_(cnxn), ipc_options_(ipc::IpcWriteOptions::Defaults()) {
+    auto mgr = arrow::cuda::CudaDeviceManager::Instance().ValueOrDie();
+    auto context = mgr->GetContext(0).ValueOrDie();
+
+    cuda_padding_bytes_ = context->Allocate(8).ValueOrDie();
+    cuMemsetD8(cuda_padding_bytes_->address(), 0, 8);
+  }
 
   Status Begin(const Schema& schema) {
     if (started_) {
@@ -247,6 +356,8 @@ class UcxStreamWriter {
   };
 
   Status WritePayload(const ipc::IpcPayload& payload) {
+    ucs_memory_type_t mem_type = UCS_MEMORY_TYPE_HOST;
+
     ++stats_.num_messages;
     unsigned int id = static_cast<unsigned int>(payload.type);
     const void* header = payload.metadata->data_as<void>();
@@ -257,15 +368,28 @@ class UcxStreamWriter {
     int32_t total_buffers = 0;
     for (const auto& buffer : payload.body_buffers) {
       if (!buffer || buffer->size() == 0) continue;
+
+      if (!buffer->is_cpu()) {
+        mem_type = UCS_MEMORY_TYPE_CUDA;
+      }
+
       total_buffers++;
       // arrow ipc requires aligning buffers to 8 byte boundary
       const auto remainder = static_cast<int>(
           bit_util::RoundUpToMultipleOf8(buffer->size()) - buffer->size());
       if (remainder) total_buffers++;
     }
+
     pending->iovs.resize(total_buffers);
     ucp_dt_iov_t* iov = pending->iovs.data();
     pending->body_buffers = payload.body_buffers;
+
+    void* padding_bytes =
+        const_cast<void*>(reinterpret_cast<const void*>(padding_bytes_.data()));
+    if (mem_type == UCS_MEMORY_TYPE_CUDA) {
+      padding_bytes = const_cast<void*>(
+          reinterpret_cast<const void*>(cuda_padding_bytes_->address()));
+    }
 
     for (const auto& buffer : payload.body_buffers) {
       if (!buffer || buffer->size() == 0) continue;
@@ -277,8 +401,7 @@ class UcxStreamWriter {
       const auto remainder = static_cast<int>(
           bit_util::RoundUpToMultipleOf8(buffer->size()) - buffer->size());
       if (remainder) {
-        iov->buffer =
-            const_cast<void*>(reinterpret_cast<const void*>(padding_bytes_.data()));
+        iov->buffer = padding_bytes;
         iov->length = remainder;
         ++iov;
       }
@@ -290,7 +413,8 @@ class UcxStreamWriter {
     // if we're dealing with other memory types?
     return cnxn_->SendAMIov(
         id, header, header_length, pending_iov->iovs.data(), pending_iov->iovs.size(),
-        pending_iov, [](void* request, ucs_status_t status, void* user_data) {
+        pending_iov,
+        [](void* request, ucs_status_t status, void* user_data) {
           auto pending_iov = reinterpret_cast<PendingIOV*>(user_data);
           if (status != UCS_OK) {
             ARROW_LOG(WARNING)
@@ -298,7 +422,8 @@ class UcxStreamWriter {
           }
           delete pending_iov;
           ucp_request_free(request);
-        });
+        },
+        mem_type);
   }
 
   Connection* cnxn_;
@@ -310,14 +435,18 @@ class UcxStreamWriter {
   bool dicts_written_{false};
 
   const std::array<uint8_t, 8> padding_bytes_{0, 0, 0, 0, 0, 0, 0, 0};
+  std::unique_ptr<cuda::CudaBuffer> cuda_padding_bytes_;
 };
 
 class Requester {
  public:
-  explicit Requester(Connection* conn) : cnxn_{conn} {}
+  Requester(Connection* conn, std::shared_ptr<Device> device)
+      : cnxn_{conn}, device_{std::move(device)} {}
 
   arrow::Result<std::unique_ptr<UcxStreamReader>> GetData(flight::Ticket& tkt) {
     auto reader = std::make_unique<UcxStreamReader>(cnxn_);
+    reader->set_memory_mgr(device_->default_memory_manager());
+
     RETURN_NOT_OK(reader->SetHandlers());
 
     RETURN_NOT_OK(
@@ -327,6 +456,7 @@ class Requester {
 
  private:
   Connection* cnxn_;
+  std::shared_ptr<Device> device_{CPUDevice::Instance()};
 };
 
 class DataServer : public UcxServer {
@@ -336,9 +466,29 @@ class DataServer : public UcxServer {
     if (!st.ok()) {
       st.Abort();
     }
+
+    st = copy_to_cuda();
+    if (!st.ok()) {
+      st.Abort();
+    }
   }
 
  protected:
+  Status copy_to_cuda() {
+    ARROW_ASSIGN_OR_RAISE(auto mgr, arrow::cuda::CudaDeviceManager::Instance());
+    ARROW_ASSIGN_OR_RAISE(auto context, mgr->GetContext(0));
+
+    // for now the simplest thing to do is to just cuda serialize and read the
+    // record batch batch onto the device. that'll give us a record batch
+    // whose data is on the cuda device, and we can play from there.
+    ARROW_ASSIGN_OR_RAISE(
+        auto buf, cuda::SerializeRecordBatch(*sample_record_batch_, context.get()));
+    ARROW_ASSIGN_OR_RAISE(
+        cuda_record_batch_,
+        cuda::ReadRecordBatch(sample_record_batch_->schema(), nullptr, buf));
+    return context->Synchronize();
+  }
+
   Status do_work(UcxServer::ClientWorker* worker) override {
     std::future<std::unique_ptr<Buffer>> fut;
     {
@@ -358,10 +508,17 @@ class DataServer : public UcxServer {
     std::cout << buf->ToString() << std::endl;
 
     UcxStreamWriter wr(worker->conn_.get());
-    RETURN_NOT_OK(wr.Begin(*sample_record_batch_->schema()));
-    RETURN_NOT_OK(wr.WriteRecordBatch(*sample_record_batch_));
-    RETURN_NOT_OK(wr.Close());
+    if (buf->ToString() == kCPUData) {
+      RETURN_NOT_OK(wr.Begin(*sample_record_batch_->schema()));
+      RETURN_NOT_OK(wr.WriteRecordBatch(*sample_record_batch_));
+    } else if (buf->ToString() == kGPUData) {
+      RETURN_NOT_OK(wr.Begin(*cuda_record_batch_->schema()));
+      RETURN_NOT_OK(wr.WriteRecordBatch(*cuda_record_batch_));
+    } else {
+      return Status::Invalid("invalid argument");
+    }
 
+    RETURN_NOT_OK(wr.Close());
     std::cout << "num messages sent: " << wr.stats().num_messages << std::endl;
 
     return Status::OK();
@@ -385,6 +542,7 @@ class DataServer : public UcxServer {
 
  private:
   std::shared_ptr<RecordBatch> sample_record_batch_;
+  std::shared_ptr<RecordBatch> cuda_record_batch_;
 
   static ucs_status_t HandleIncomingTicketMessage(void* self, const void* header,
                                                   size_t header_length, void* data,
@@ -430,7 +588,14 @@ class FlightServerWithUCXData : public FlightServerBase {
 
   Status GetFlightInfo(const ServerCallContext& context, const FlightDescriptor& request,
                        std::unique_ptr<FlightInfo>* info) override {
-    FlightEndpoint endpoint{{"ticket-ints"}, {srv.location()}, std::nullopt, {}};
+    std::string ticket;
+    if (request.cmd == "cpu") {
+      ticket = ucx::kCPUData;
+    } else if (request.cmd == "gpu") {
+      ticket = ucx::kGPUData;
+    }
+
+    FlightEndpoint endpoint{{ticket}, {srv.location()}, std::nullopt, {}};
 
     ARROW_ASSIGN_OR_RAISE(auto flightinfo,
                           FlightInfo::Make(*test_schema, request, {endpoint}, 10, -1));
@@ -442,9 +607,68 @@ class FlightServerWithUCXData : public FlightServerBase {
 };
 
 }  // namespace flight
+
+namespace cuda {
+Result<std::shared_ptr<ArrayData>> CopyToHost(const ArrayData& data, MemoryManager& mm) {
+  auto output = ArrayData::Make(data.type, data.length, data.null_count, data.offset);
+
+  output->buffers.reserve(data.buffers.size());
+  for (const auto& buf : data.buffers) {
+    if (!buf) {
+      output->buffers.push_back(nullptr);
+      continue;
+    }
+    if (buf->size() == 0) {
+      output->buffers.push_back(std::make_shared<Buffer>(nullptr, 0));
+      continue;
+    }
+    ARROW_ASSIGN_OR_RAISE(auto temp_buf, mm.AllocateBuffer(buf->size()));
+    auto cuda_buf = std::dynamic_pointer_cast<CudaBuffer>(buf);
+    RETURN_NOT_OK(cuda_buf->CopyToHost(0, cuda_buf->size(), temp_buf->mutable_data()));
+    output->buffers.push_back(std::move(temp_buf));
+  }
+
+  output->child_data.reserve(data.child_data.size());
+  for (const auto& child : data.child_data) {
+    ARROW_ASSIGN_OR_RAISE(auto copied, CopyToHost(*child, mm));
+    output->child_data.push_back(std::move(copied));
+  }
+
+  if (data.dictionary) {
+    ARROW_ASSIGN_OR_RAISE(output->dictionary, CopyToHost(*data.dictionary, mm));
+  }
+
+  return output;
+}
+
+Result<std::shared_ptr<Array>> CopyToHost(const Array& array, MemoryManager& mm) {
+  ARROW_ASSIGN_OR_RAISE(auto copied_data, CopyToHost(*array.data(), mm));
+  return MakeArray(copied_data);
+}
+
+Result<std::shared_ptr<RecordBatch>> CopyToHost(const RecordBatch& rb) {
+  auto default_mem_manager = default_cpu_memory_manager();
+  ArrayVector columns;
+  columns.reserve(rb.num_columns());
+  for (const auto& col : rb.columns()) {
+    ARROW_ASSIGN_OR_RAISE(auto c, CopyToHost(*col, *default_mem_manager));
+    columns.push_back(std::move(c));
+  }
+
+  return RecordBatch::Make(rb.schema(), rb.num_rows(), columns);
+}
+}  // namespace cuda
+
 }  // namespace arrow
 
 int main(int argc, char** argv) {
+  std::string command = "cpu";
+  if (argc >= 2) {
+    if (std::strcmp(argv[1], "--gpu") == 0) {
+      command = "gpu";
+    }
+  }
+
   arrow::util::ArrowLog::StartArrowLog("ucxpoc", arrow::util::ArrowLogLevel::ARROW_DEBUG);
 
   auto flight_server =
@@ -460,21 +684,29 @@ int main(int argc, char** argv) {
 
   auto client = *arrow::flight::FlightClient::Connect(flight_server->location());
 
-  auto info = *client->GetFlightInfo(arrow::flight::FlightDescriptor::Command("foobar"));
+  auto info = *client->GetFlightInfo(arrow::flight::FlightDescriptor::Command(command));
   std::cout << info->endpoints()[0].locations[0].ToString() << std::endl;
+
+  std::shared_ptr<arrow::Device> device = arrow::CPUDevice::Instance();
+  if (command == "gpu") {
+    device = *(*arrow::cuda::CudaDeviceManager::Instance())->GetDevice(0);
+  }
 
   arrow::ucx::UcxClient ucx_client;
   ARROW_CHECK_OK(ucx_client.Init(info->endpoints()[0].locations[0]));
   auto conn = *ucx_client.Get();
 
   auto tkt = info->endpoints()[0].ticket;
-  arrow::ucx::Requester req{&conn};
+  arrow::ucx::Requester req{&conn, device};
 
   auto rdr = req.GetData(tkt).ValueOrDie();
   auto sc = *rdr->GetSchema();
   std::cout << sc->ToString() << std::endl;
 
-  auto rec = rdr->ReadNext().ValueOrDie();
+  auto rec = rdr->ReadNext().ValueOrDie();  
+  if (command == "gpu") {
+    rec = arrow::cuda::CopyToHost(*rec).ValueOrDie();
+  }
   std::cout << rec->ToString() << std::endl;
 
   // lots of "error during flush: Connection reset by remote peer"

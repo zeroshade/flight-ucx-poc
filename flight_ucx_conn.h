@@ -51,7 +51,7 @@ class Connection {
   Status SendAM(unsigned int id, const void* data, const int64_t size);
   Status SendAMIov(unsigned int id, const void* header, const size_t header_length,
                    const ucp_dt_iov_t* iov, const size_t iov_cnt, void* user_data,
-                   ucp_send_nbx_callback_t cb);
+                   ucp_send_nbx_callback_t cb, const ucs_memory_type_t memory_type);
   Status SendStream(const void* data, const size_t length);
   ucs_status_t RecvAM(std::promise<std::unique_ptr<Buffer>> p, const void* header,
                       const size_t header_length, void* data, const size_t data_length,
