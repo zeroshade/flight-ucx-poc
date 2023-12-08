@@ -39,10 +39,11 @@ namespace arrow {
 namespace ucx {
 class UcxServer {
  public:
-  Status Init(const internal::Uri& uri);
+  virtual ~UcxServer() = default;
+  virtual Status Init(const internal::Uri& uri);
   Status Wait();
   inline flight::Location location() const { return location_; }
-  Status Shutdown();
+  virtual Status Shutdown();
 
  protected:
   struct ClientWorker {
@@ -66,7 +67,7 @@ class UcxServer {
   void EnqueueClient(ucp_conn_request_h connection_request);
   void DriveConnections();
   void WorkerLoop(ucp_conn_request_h request);
-  arrow::Result<std::shared_ptr<ClientWorker>> CreateWorker();  
+  arrow::Result<std::shared_ptr<ClientWorker>> CreateWorker();
 
  protected:
   std::atomic<size_t> counter_;

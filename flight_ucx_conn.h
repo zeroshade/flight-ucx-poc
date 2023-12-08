@@ -49,6 +49,8 @@ class Connection {
   Status Flush();
   Status Close();
   Status SendAM(unsigned int id, const void* data, const int64_t size);
+  Status SendAM(unsigned int id, const void* header, const size_t header_length,
+                const void* data, const size_t data_length);
   Status SendAMIov(unsigned int id, const void* header, const size_t header_length,
                    const ucp_dt_iov_t* iov, const size_t iov_cnt, void* user_data,
                    ucp_send_nbx_callback_t cb, const ucs_memory_type_t memory_type);
@@ -65,6 +67,8 @@ class Connection {
 
   int MakeProgress() { return ucp_worker_progress(ucp_worker_->get()); }
   std::shared_ptr<UcpWorker> worker() { return ucp_worker_; }
+  ucp_ep_h endpoint() const { return remote_endpoint_; }
+
  protected:
   inline Status CheckClosed() {
     if (!remote_endpoint_) {

@@ -87,7 +87,9 @@ add_executable(flight-ucx-poc flight_ucx_poc.cc
                               flight_ucx_conn.cc
                               flight_ucx_utils.cc
                               flight_ucx_server.cc
-                              flight_ucx_client.cc)
+                              flight_ucx_client.cc
+                              ucx_mmap_alloc.cc
+                              random_generation.cc)
 target_link_libraries(flight-ucx-poc arrow_shared arrow_testing_shared
                                      arrow_cuda_shared
                                      arrow_flight_shared ucx::ucx)

@@ -18,6 +18,8 @@
 #include "flight_ucx_client.h"
 #include "flight_ucx_conn.h"
 #include "flight_ucx_server.h"
+#include "random_generation.h"
+#include "ucx_mmap_alloc.h"
 
 #include <signal.h>
 #include <ucp/api/ucp.h>
@@ -48,11 +50,12 @@ namespace ucx {
 
 static constexpr char kCPUData[] = "ticket-ints-cpu";
 static constexpr char kGPUData[] = "ticket-ints-gpu";
+static constexpr unsigned int RMA_RECORD_BATCH_ID = 42;
 
 class UcxStreamReader {
  public:
-  explicit UcxStreamReader(Connection* cnxn)
-      : cnxn_(cnxn), ipc_options_(ipc::IpcReadOptions::Defaults()) {}
+  explicit UcxStreamReader(Connection* cnxn, std::string rkey)
+      : cnxn_(cnxn), rkey_buf_{rkey}, ipc_options_(ipc::IpcReadOptions::Defaults()) {}
 
   void set_memory_mgr(std::shared_ptr<MemoryManager> mm) {
     if (!mm) {
@@ -74,6 +77,10 @@ class UcxStreamReader {
 
     params.id = static_cast<unsigned int>(ipc::MessageType::RECORD_BATCH);
     params.cb = RecvRecordBatchMsg;
+    RETURN_NOT_OK(cnxn_->SetAMHandler(&params));
+
+    params.id = RMA_RECORD_BATCH_ID;
+    params.cb = RecvMappedRecordBatchMsg;
     RETURN_NOT_OK(cnxn_->SetAMHandler(&params));
 
     params.id = kEndStream;
@@ -101,7 +108,7 @@ class UcxStreamReader {
             break;
           }
         }
-      }      
+      }
     }).detach();
 
     std::unique_lock<std::mutex> lock(stream_lock_);
@@ -154,6 +161,133 @@ class UcxStreamReader {
     std::lock_guard<std::mutex> lock(rdr->stream_lock_);
     rdr->schema_ = ipc::ReadSchema(*msg, &rdr->dictionary_memo_).ValueOrDie();
     return UCS_OK;
+  }
+
+  static void logging_callback(void* request, ucs_status_t status, void* user_data) {
+    ucp_request_free(request);
+    long val = reinterpret_cast<long>(user_data);
+    if (status == UCS_OK) {
+      ARROW_LOG(DEBUG) << "logging_callback success: " << val;
+    } else {
+      ARROW_LOG(DEBUG) << "logging_callback " << val << " "
+                       << FromUcsStatus("ucp_get_nbx", status).ToString();
+    }
+  }
+
+  void process_mapped_buffers(std::promise<processed_rb> promise,
+                              std::shared_ptr<Buffer> metadata,
+                              std::shared_ptr<Buffer> buffer_info) {
+    ucp_rkey_h rkey;
+    auto status = ucp_ep_rkey_unpack(cnxn_->endpoint(), rkey_buf_.data(), &rkey);
+    if (status != UCS_OK) {
+      ucp_rkey_destroy(rkey);
+      promise.set_value(FromUcsStatus("ucp_ep_rkey_unpack", status));
+      return;
+    }
+
+    auto* buffers = reinterpret_cast<const std::pair<uint64_t, uint64_t>*>(
+        buffer_info->data_as<void>());
+    uint64_t total_size = buffers[0].first;
+    uint64_t num_bufs = buffers[0].second;
+    buffers++;
+
+    auto outbuf = rndv_mem_mgr_->AllocateBuffer(total_size).ValueOrDie();
+    void* outptr = const_cast<void*>(outbuf->data_as<void>());
+    std::memset(outptr, 0, outbuf->size());
+    uint64_t offset = 0;
+
+    ucp_request_param_t param;
+    param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA;
+    param.cb.send = logging_callback;
+
+    for (auto* p = buffers; p != buffers + num_bufs; p++) {
+      if (p->first == 0) {
+        offset += p->second;
+        continue;
+      }
+
+      param.user_data = reinterpret_cast<void*>(std::distance(buffers, p));
+
+      auto status = ucp_get_nbx(cnxn_->endpoint(), UCS_PTR_BYTE_OFFSET(outptr, offset),
+                                p->second, p->first, rkey, &param);
+      if (UCS_PTR_IS_ERR(status)) {
+        ucp_rkey_destroy(rkey);
+        promise.set_value(FromUcsStatus("ucp_get_nbx", UCS_PTR_STATUS(status)));
+        return;
+      }
+
+      offset += p->second;
+    }
+
+    auto flush_status = cnxn_->Flush();
+    if (!flush_status.ok()) {
+      ucp_rkey_destroy(rkey);
+      promise.set_value(flush_status);
+      return;
+    }
+
+    ucp_rkey_destroy(rkey);
+
+    auto msg = *ipc::Message::Open(metadata, std::move(outbuf));
+    auto rec = ipc::ReadRecordBatch(*msg, schema_, &dictionary_memo_, ipc_options_);
+    promise.set_value(std::move(rec));
+    --outstanding_rndv_;
+  }
+
+  static ucs_status_t RecvMappedRecordBatchMsg(void* arg, const void* header,
+                                               size_t header_length, void* data,
+                                               size_t length,
+                                               const ucp_am_recv_param_t* param) {
+    UcxStreamReader* rdr = reinterpret_cast<UcxStreamReader*>(arg);
+    std::lock_guard<std::mutex> lock(rdr->stream_lock_);
+
+    std::promise<processed_rb> promise;
+    rdr->queue_.push(promise.get_future());
+    auto metadata =
+        std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(header), header_length);
+    if (param->recv_attr & UCP_AM_RECV_ATTR_FLAG_DATA) {
+      auto buffer_info =
+          std::make_shared<UcxDataBuffer>(rdr->cnxn_->worker(), data, length);
+      std::thread(&UcxStreamReader::process_mapped_buffers, rdr, std::move(promise),
+                  std::move(metadata), std::move(buffer_info))
+          .detach();
+      return UCS_INPROGRESS;
+    }
+
+    if (param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) {
+      auto maybe_buffer = rdr->rndv_mem_mgr_->AllocateBuffer(length);
+      if (!maybe_buffer.ok()) {
+        ARROW_LOG(WARNING) << "failed mem mgr AllocateBuffer(" << length
+                           << "):" << maybe_buffer.status().ToString();
+        return UCS_ERR_NO_MEMORY;
+      }
+
+      PendingDataRecv* pending_recv = new PendingDataRecv{
+          std::move(promise), std::move(metadata), maybe_buffer.MoveValueUnsafe()};
+
+      void* dest = pending_recv->buffer->mutable_data_as<void>();
+      ucp_request_param_t recv_param;
+      recv_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA;
+      recv_param.user_data = reinterpret_cast<void*>(pending_recv);
+      recv_param.cb.recv_am = RecvDataMappedCB;
+
+      void* request = ucp_am_recv_data_nbx(rdr->cnxn_->worker()->get(), data, dest,
+                                           length, &recv_param);
+      if (UCS_PTR_IS_ERR(request)) {
+        ucs_status_t st = UCS_PTR_STATUS(request);
+        pending_recv->promise.set_value(FromUcsStatus("ucp_am_recv_data_nbx", st));
+        delete pending_recv;
+        return st;
+      } else if (!request) {
+        RecvDataMappedCB(request, UCS_OK, length, recv_param.user_data);
+        return UCS_OK;
+      }
+
+      ++rdr->outstanding_rndv_;
+      return UCS_OK;
+    }
+
+    return UCS_ERR_IO_ERROR;
   }
 
   static ucs_status_t RecvRecordBatchMsg(void* arg, const void* header,
@@ -241,6 +375,25 @@ class UcxStreamReader {
     return UCS_OK;
   }
 
+  static void RecvDataMappedCB(void* request, ucs_status_t status, size_t length,
+                               void* user_data) {
+    PendingDataRecv* pending_recv = reinterpret_cast<PendingDataRecv*>(user_data);
+    if (request) {
+      ucp_request_free(request);
+    }
+    if (status != UCS_OK) {
+      pending_recv->promise.set_value(
+          FromUcsStatus("ucp_am_recv_data_nbx (callback)", status));
+    } else {
+      std::thread(&UcxStreamReader::process_mapped_buffers, pending_recv->rdr,
+                  std::move(pending_recv->promise), std::move(pending_recv->metadata),
+                  std::move(pending_recv->buffer))
+          .detach();
+    }
+
+    delete pending_recv;
+  }
+
   static void RecvAMDataCB(void* request, ucs_status_t status, size_t length,
                            void* user_data) {
     PendingDataRecv* pending_recv = reinterpret_cast<PendingDataRecv*>(user_data);
@@ -263,6 +416,8 @@ class UcxStreamReader {
 
  private:
   Connection* cnxn_;
+  // ucp_rkey_h rkey_;
+  std::string rkey_buf_;
   std::atomic<bool> finished_{false};
   std::condition_variable cv_progress_;
   std::mutex stream_lock_;
@@ -317,6 +472,43 @@ class UcxStreamWriter {
     RETURN_NOT_OK(ipc::GetRecordBatchPayload(batch, ipc_options_, &payload));
     RETURN_NOT_OK(WritePayload(payload));
     ++stats_.num_record_batches;
+    return Status::OK();
+  }
+
+  Status WriteMappedRecordBatch(const RecordBatch& batch) {
+    if (!started_) {
+      return Status::Invalid("writer has not been started yet");
+    }
+
+    ipc::IpcPayload payload;
+    // the drawback here is that if there are any slices involved here
+    // i.e. anything with a non-zero offset, then we're going to end up with
+    // spurious allocations here to pass as IPC. is there a more optimal
+    // way to handle this, particularly for non-cpu memory?
+    RETURN_NOT_OK(ipc::GetRecordBatchPayload(batch, ipc_options_, &payload));
+
+    unsigned int id = RMA_RECORD_BATCH_ID;
+    const void* header = payload.metadata->data_as<void>();
+    const size_t header_length = payload.metadata->size();
+
+    std::vector<std::pair<uint64_t, uint64_t>> buffers;
+    buffers.emplace_back(payload.body_length, 0);
+
+    for (const auto& buffer : payload.body_buffers) {
+      if (!buffer || buffer->size() == 0) continue;
+      buffers.emplace_back(buffer->address(), buffer->size());
+      const auto remainder = static_cast<int>(
+          bit_util::RoundUpToMultipleOf8(buffer->size()) - buffer->size());
+      if (remainder) {
+        buffers.emplace_back(0, remainder);
+      }
+    }
+    buffers[0].second = buffers.size() - 1;
+
+    RETURN_NOT_OK(cnxn_->SendAM(id, header, header_length,
+                                reinterpret_cast<void*>(buffers.data()),
+                                buffers.size() * (2 * sizeof(uint64_t))));
+
     return Status::OK();
   }
 
@@ -443,8 +635,9 @@ class Requester {
   Requester(Connection* conn, std::shared_ptr<Device> device)
       : cnxn_{conn}, device_{std::move(device)} {}
 
-  arrow::Result<std::unique_ptr<UcxStreamReader>> GetData(flight::Ticket& tkt) {
-    auto reader = std::make_unique<UcxStreamReader>(cnxn_);
+  arrow::Result<std::unique_ptr<UcxStreamReader>> GetData(flight::Ticket& tkt,
+                                                          std::string rkey) {
+    auto reader = std::make_unique<UcxStreamReader>(cnxn_, rkey);
     reader->set_memory_mgr(device_->default_memory_manager());
 
     RETURN_NOT_OK(reader->SetHandlers());
@@ -461,16 +654,38 @@ class Requester {
 
 class DataServer : public UcxServer {
  public:
-  DataServer() : UcxServer() {
-    auto st = ipc::test::MakeIntRecordBatch(&sample_record_batch_);
-    if (!st.ok()) {
-      st.Abort();
+  DataServer() : UcxServer() {}
+
+  Status Init(const internal::Uri& uri) override {
+    RETURN_NOT_OK(UcxServer::Init(uri));
+
+    ARROW_ASSIGN_OR_RAISE(auto mapped_pool, arrow::ucx::UcxMappedPool::Make(
+                                                ucp_context_->get(), 1024 * 1024 * 1024));
+
+    RETURN_NOT_OK(MakeIntRecordBatch(&sample_record_batch_, mapped_pool.get()));
+    mapped_pool_ = std::move(mapped_pool);
+
+    ucs_status_t status = ucp_rkey_pack(
+        ucp_context_->get(), mapped_pool_->get_mem_handle(), &rkey_buffer, &rkey_size);
+    if (status != UCS_OK) {
+      return FromUcsStatus("ucp_rkey_pack", status);
     }
 
-    st = copy_to_cuda();
-    if (!st.ok()) {
-      st.Abort();
+    return copy_to_cuda();
+  }
+
+  Status Shutdown() override {
+    sample_record_batch_.reset();
+    ucs_status_t st = ucp_mem_unmap(ucp_context_->get(), mapped_pool_->get_mem_handle());
+    if (st != UCS_OK) {
+      return FromUcsStatus("ucp_mem_unmap", st);
     }
+    mapped_pool_.reset();
+    return UcxServer::Shutdown();
+  }
+
+  std::string_view get_rkey_buffer() const {
+    return std::string_view{reinterpret_cast<char*>(rkey_buffer), rkey_size};
   }
 
  protected:
@@ -507,10 +722,34 @@ class DataServer : public UcxServer {
     auto buf = fut.get();
     std::cout << buf->ToString() << std::endl;
 
+    // auto memh = mapped_pool_->get_mem_handle();
+    // ucp_memh_pack_params_t params;
+    // void* rkey_buffer;
+    // size_t rkey_size;
+    // ucs_status_t status = ucp_rkey_pack(worker->worker_->context().get(), memh,
+    // &rkey_buffer, &rkey_size); if (status != UCS_OK) {
+    //   return FromUcsStatus("ucp_memh_pack", status);
+    // }
+
+    // // auto* exported_memh = mapped_pool_->get_exported_memh();
+    // ucp_rkey_h rkey;
+    // status = ucp_ep_rkey_unpack(worker->conn_->endpoint(), rkey_buffer, &rkey);
+    // if (status != UCS_OK) {
+    //   return FromUcsStatus("ucp_ep_rkey_unpack", status);
+    // }
+
+    // auto addr = sample_record_batch_->column(0)->data()->buffers[1]->address();
+    // void* ptr = nullptr;
+    // status = ucp_rkey_ptr(rkey, reinterpret_cast<uint64_t>(addr), &ptr);
+    // if (status != UCS_OK) {
+    //   return FromUcsStatus("ucp_rkey_ptr", status);
+    // }
+
     UcxStreamWriter wr(worker->conn_.get());
     if (buf->ToString() == kCPUData) {
       RETURN_NOT_OK(wr.Begin(*sample_record_batch_->schema()));
-      RETURN_NOT_OK(wr.WriteRecordBatch(*sample_record_batch_));
+      RETURN_NOT_OK(wr.WriteMappedRecordBatch(*sample_record_batch_));
+      // RETURN_NOT_OK(wr.WriteRecordBatch(*sample_record_batch_));
     } else if (buf->ToString() == kGPUData) {
       RETURN_NOT_OK(wr.Begin(*cuda_record_batch_->schema()));
       RETURN_NOT_OK(wr.WriteRecordBatch(*cuda_record_batch_));
@@ -543,6 +782,9 @@ class DataServer : public UcxServer {
  private:
   std::shared_ptr<RecordBatch> sample_record_batch_;
   std::shared_ptr<RecordBatch> cuda_record_batch_;
+  std::unique_ptr<UcxMappedPool> mapped_pool_;
+  void* rkey_buffer;
+  size_t rkey_size;
 
   static ucs_status_t HandleIncomingTicketMessage(void* self, const void* header,
                                                   size_t header_length, void* data,
@@ -597,8 +839,10 @@ class FlightServerWithUCXData : public FlightServerBase {
 
     FlightEndpoint endpoint{{ticket}, {srv.location()}, std::nullopt, {}};
 
-    ARROW_ASSIGN_OR_RAISE(auto flightinfo,
-                          FlightInfo::Make(*test_schema, request, {endpoint}, 10, -1));
+    std::string meta{srv.get_rkey_buffer()};
+    ARROW_ASSIGN_OR_RAISE(
+        auto flightinfo,
+        FlightInfo::Make(*test_schema, request, {endpoint}, 10, -1, false, meta));
     *info = std::make_unique<FlightInfo>(std::move(flightinfo));
     return Status::OK();
   }
@@ -696,14 +940,16 @@ int main(int argc, char** argv) {
   ARROW_CHECK_OK(ucx_client.Init(info->endpoints()[0].locations[0]));
   auto conn = *ucx_client.Get();
 
+  const auto rkey_buf = info->app_metadata();
+
   auto tkt = info->endpoints()[0].ticket;
   arrow::ucx::Requester req{&conn, device};
 
-  auto rdr = req.GetData(tkt).ValueOrDie();
+  auto rdr = req.GetData(tkt, rkey_buf).ValueOrDie();
   auto sc = *rdr->GetSchema();
   std::cout << sc->ToString() << std::endl;
 
-  auto rec = rdr->ReadNext().ValueOrDie();  
+  auto rec = rdr->ReadNext().ValueOrDie();
   if (command == "gpu") {
     rec = arrow::cuda::CopyToHost(*rec).ValueOrDie();
   }

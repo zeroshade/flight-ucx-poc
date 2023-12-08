@@ -17,13 +17,14 @@
 
 #include "flight_ucx_server.h"
 #include "flight_ucx_utils.h"
+#include "ucx_mmap_alloc.h"
 
 #include <netdb.h>
 #include "arrow/flight/types.h"
+#include "arrow/gpu/cuda_api.h"
 #include "arrow/util/string.h"
 #include "arrow/util/thread_pool.h"
 #include "arrow/util/uri.h"
-#include "arrow/gpu/cuda_api.h"
 
 namespace arrow {
 using internal::ToChars;
@@ -52,8 +53,8 @@ Status UcxServer::Init(const internal::Uri& uri) {
     std::memset(&ucp_params, 0, sizeof(ucp_params));
     ucp_params.field_mask = UCP_PARAM_FIELD_FEATURES | UCP_PARAM_FIELD_NAME |
                             UCP_PARAM_FIELD_MT_WORKERS_SHARED;
-    ucp_params.features =
-        UCP_FEATURE_AM | UCP_FEATURE_STREAM | UCP_FEATURE_WAKEUP | UCP_FEATURE_RMA;
+    ucp_params.features = UCP_FEATURE_AM | UCP_FEATURE_WAKEUP | UCP_FEATURE_RMA |
+                          UCP_FEATURE_STREAM | UCP_FEATURE_TAG;
     ucp_params.mt_workers_shared = UCS_THREAD_MODE_MULTI;
     ucp_params.name = "ucx_flight_data_server";
 

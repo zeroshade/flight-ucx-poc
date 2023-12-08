@@ -137,20 +137,35 @@ Status Connection::SendAM(unsigned int id, const void* data, const int64_t size)
   return CompleteRequestBlocking("ucp_am_send_nbx", request);
 }
 
+Status Connection::SendAM(unsigned int id, const void* header, const size_t header_length,
+                          const void* data, const size_t data_length) {
+  RETURN_NOT_OK(CheckClosed());
+
+  ucp_request_param_t request_param;
+  request_param.op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS;
+  request_param.flags = UCP_AM_SEND_FLAG_REPLY;
+
+  void* request = ucp_am_send_nbx(remote_endpoint_, id, header, header_length, data,
+                                  data_length, &request_param);
+  return CompleteRequestBlocking("ucp_am_send_nbx", request);
+}
+
 Status Connection::SendAMIov(unsigned int id, const void* header,
                              const size_t header_length, const ucp_dt_iov_t* iov,
                              const size_t iov_cnt, void* user_data,
-                             ucp_send_nbx_callback_t cb, const ucs_memory_type_t memory_type) {
+                             ucp_send_nbx_callback_t cb,
+                             const ucs_memory_type_t memory_type) {
   RETURN_NOT_OK(CheckClosed());
 
   ucp_request_param_t request_param;
   request_param.op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS | UCP_OP_ATTR_FIELD_DATATYPE |
                                UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA |
                                UCP_OP_ATTR_FIELD_MEMORY_TYPE;
-  request_param.flags = UCP_AM_SEND_FLAG_COPY_HEADER | UCP_AM_SEND_FLAG_REPLY | UCP_AM_SEND_FLAG_RNDV;
+  request_param.flags = UCP_AM_SEND_FLAG_COPY_HEADER | UCP_AM_SEND_FLAG_REPLY;
+  // request_param.flags |= UCP_AM_SEND_FLAG_RNDV;
   request_param.datatype = UCP_DATATYPE_IOV;
   request_param.cb.send = cb;
-  request_param.user_data = user_data;  
+  request_param.user_data = user_data;
   request_param.memory_type = memory_type;
 
   void* request = ucp_am_send_nbx(remote_endpoint_, id, header, header_length, iov,
