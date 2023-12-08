@@ -177,6 +177,12 @@ class UcxStreamReader {
   void process_mapped_buffers(std::promise<processed_rb> promise,
                               std::shared_ptr<Buffer> metadata,
                               std::shared_ptr<Buffer> buffer_info) {
+    if (arrow::cuda::IsCudaMemoryManager(*rndv_mem_mgr_)) {
+      auto ctx = *(*arrow::cuda::AsCudaMemoryManager(rndv_mem_mgr_))
+                      ->cuda_device()
+                      ->GetContext();
+      cuCtxPushCurrent(reinterpret_cast<CUcontext>(ctx->handle()));
+    }
     ucp_rkey_h rkey;
     auto status = ucp_ep_rkey_unpack(cnxn_->endpoint(), rkey_buf_.data(), &rkey);
     if (status != UCS_OK) {
@@ -192,13 +198,19 @@ class UcxStreamReader {
     buffers++;
 
     auto outbuf = rndv_mem_mgr_->AllocateBuffer(total_size).ValueOrDie();
-    void* outptr = const_cast<void*>(outbuf->data_as<void>());
-    std::memset(outptr, 0, outbuf->size());
+    void* outptr = reinterpret_cast<void*>(outbuf->mutable_address());
+    if (outbuf->is_cpu()) {
+      std::memset(outptr, 0, outbuf->size());
+    } else {
+      cuMemsetD8(outbuf->mutable_address(), 0, outbuf->size());
+    }
     uint64_t offset = 0;
 
     ucp_request_param_t param;
-    param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA;
+    param.op_attr_mask = UCP_OP_ATTR_FIELD_MEMORY_TYPE | UCP_OP_ATTR_FIELD_CALLBACK |
+                         UCP_OP_ATTR_FIELD_USER_DATA;
     param.cb.send = logging_callback;
+    param.memory_type = (outbuf->is_cpu()) ? UCS_MEMORY_TYPE_HOST : UCS_MEMORY_TYPE_CUDA;
 
     for (auto* p = buffers; p != buffers + num_bufs; p++) {
       if (p->first == 0) {
@@ -415,8 +427,7 @@ class UcxStreamReader {
   }
 
  private:
-  Connection* cnxn_;
-  // ucp_rkey_h rkey_;
+  Connection* cnxn_;  
   std::string rkey_buf_;
   std::atomic<bool> finished_{false};
   std::condition_variable cv_progress_;
@@ -655,6 +666,16 @@ class Requester {
 class DataServer : public UcxServer {
  public:
   DataServer() : UcxServer() {}
+  ~DataServer() {
+    if (rkey_buffer != nullptr) {
+      ucp_rkey_buffer_release(rkey_buffer);
+      rkey_buffer = nullptr;
+    }
+    if (cuda_rkey_buffer_ != nullptr) {
+      ucp_rkey_buffer_release(cuda_rkey_buffer_);
+      cuda_rkey_buffer_ = nullptr;
+    }
+  }
 
   Status Init(const internal::Uri& uri) override {
     RETURN_NOT_OK(UcxServer::Init(uri));
@@ -681,6 +702,12 @@ class DataServer : public UcxServer {
       return FromUcsStatus("ucp_mem_unmap", st);
     }
     mapped_pool_.reset();
+
+    cuda_record_batch_.reset();
+    st = ucp_mem_unmap(ucp_context_->get(), cuda_mem_handle_);
+    if (st != UCS_OK) {
+      return FromUcsStatus("ucp_mem_unmap cuda", st);
+    }
     return UcxServer::Shutdown();
   }
 
@@ -688,16 +715,42 @@ class DataServer : public UcxServer {
     return std::string_view{reinterpret_cast<char*>(rkey_buffer), rkey_size};
   }
 
+  std::string_view get_cuda_rkey_buffer() const {
+    return std::string_view{reinterpret_cast<char*>(cuda_rkey_buffer_), cuda_rkey_size_};
+  }
+
  protected:
   Status copy_to_cuda() {
     ARROW_ASSIGN_OR_RAISE(auto mgr, arrow::cuda::CudaDeviceManager::Instance());
     ARROW_ASSIGN_OR_RAISE(auto context, mgr->GetContext(0));
+    cuCtxPushCurrent(reinterpret_cast<CUcontext>(context->handle()));
 
     // for now the simplest thing to do is to just cuda serialize and read the
     // record batch batch onto the device. that'll give us a record batch
     // whose data is on the cuda device, and we can play from there.
     ARROW_ASSIGN_OR_RAISE(
         auto buf, cuda::SerializeRecordBatch(*sample_record_batch_, context.get()));
+
+    ucp_mem_map_params_t params;
+    params.field_mask = UCP_MEM_MAP_PARAM_FIELD_LENGTH |
+                        UCP_MEM_MAP_PARAM_FIELD_MEMORY_TYPE |
+                        UCP_MEM_MAP_PARAM_FIELD_ADDRESS;
+    params.length = buf->size();
+    params.address = reinterpret_cast<void*>(buf->address());
+    // params.flags = UCP_MEM_MAP_NONBLOCK;
+    params.memory_type = UCS_MEMORY_TYPE_CUDA;
+
+    auto status = ucp_mem_map(ucp_context_->get(), &params, &cuda_mem_handle_);
+    if (status != UCS_OK) {
+      return FromUcsStatus("ucp_mem_map cuda", status);
+    }
+
+    status = ucp_rkey_pack(ucp_context_->get(), cuda_mem_handle_, &cuda_rkey_buffer_,
+                           &cuda_rkey_size_);
+    if (status != UCS_OK) {
+      return FromUcsStatus("ucp_memh_pack cuda", status);
+    }
+
     ARROW_ASSIGN_OR_RAISE(
         cuda_record_batch_,
         cuda::ReadRecordBatch(sample_record_batch_->schema(), nullptr, buf));
@@ -752,7 +805,8 @@ class DataServer : public UcxServer {
       // RETURN_NOT_OK(wr.WriteRecordBatch(*sample_record_batch_));
     } else if (buf->ToString() == kGPUData) {
       RETURN_NOT_OK(wr.Begin(*cuda_record_batch_->schema()));
-      RETURN_NOT_OK(wr.WriteRecordBatch(*cuda_record_batch_));
+      // RETURN_NOT_OK(wr.WriteRecordBatch(*cuda_record_batch_));
+      RETURN_NOT_OK(wr.WriteMappedRecordBatch(*cuda_record_batch_));
     } else {
       return Status::Invalid("invalid argument");
     }
@@ -783,8 +837,12 @@ class DataServer : public UcxServer {
   std::shared_ptr<RecordBatch> sample_record_batch_;
   std::shared_ptr<RecordBatch> cuda_record_batch_;
   std::unique_ptr<UcxMappedPool> mapped_pool_;
-  void* rkey_buffer;
-  size_t rkey_size;
+  ucp_mem_h cuda_mem_handle_;
+  void* rkey_buffer{nullptr};
+  size_t rkey_size{0};
+
+  void* cuda_rkey_buffer_{nullptr};
+  size_t cuda_rkey_size_{0};
 
   static ucs_status_t HandleIncomingTicketMessage(void* self, const void* header,
                                                   size_t header_length, void* data,
@@ -830,16 +888,17 @@ class FlightServerWithUCXData : public FlightServerBase {
 
   Status GetFlightInfo(const ServerCallContext& context, const FlightDescriptor& request,
                        std::unique_ptr<FlightInfo>* info) override {
-    std::string ticket;
+    std::string ticket, meta;
     if (request.cmd == "cpu") {
       ticket = ucx::kCPUData;
+      meta = srv.get_rkey_buffer();
     } else if (request.cmd == "gpu") {
       ticket = ucx::kGPUData;
+      meta = srv.get_cuda_rkey_buffer();
     }
 
     FlightEndpoint endpoint{{ticket}, {srv.location()}, std::nullopt, {}};
-
-    std::string meta{srv.get_rkey_buffer()};
+    
     ARROW_ASSIGN_OR_RAISE(
         auto flightinfo,
         FlightInfo::Make(*test_schema, request, {endpoint}, 10, -1, false, meta));
