@@ -79,6 +79,9 @@ find_package(ArrowCUDA REQUIRED)
 find_package(ArrowTesting REQUIRED)
 message(STATUS "Found Arrow: ${ARROW_VERSION}")
 
+# find_package(ucx REQUIRED)
+find_package(gflags REQUIRED)
+# link_directories(${UCX_LIBRARIES})
 add_library(ucx::ucx INTERFACE IMPORTED)
 target_include_directories(ucx::ucx INTERFACE "${UCX_INCLUDE_DIRS}")
 target_link_libraries(ucx::ucx INTERFACE ucx::ucp ucx::uct ucx::ucs)
@@ -92,4 +95,4 @@ add_executable(flight-ucx-poc flight_ucx_poc.cc
                               random_generation.cc)
 target_link_libraries(flight-ucx-poc arrow_shared arrow_testing_shared
                                      arrow_cuda_shared
-                                     arrow_flight_shared ucx::ucx)
+                                     arrow_flight_shared gflags ucx::ucx)

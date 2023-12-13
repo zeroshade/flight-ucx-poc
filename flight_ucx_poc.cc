@@ -26,6 +26,7 @@
 #include <future>
 #include <iostream>
 #include <memory>
+#include <gflags/gflags.h>
 
 #include "arrow/buffer.h"
 #include "arrow/flight/client.h"
@@ -964,61 +965,75 @@ Result<std::shared_ptr<RecordBatch>> CopyToHost(const RecordBatch& rb) {
 
 }  // namespace arrow
 
-int main(int argc, char** argv) {
-  std::string command = "cpu";
-  if (argc >= 2) {
-    if (std::strcmp(argv[1], "--gpu") == 0) {
-      command = "gpu";
-    }
-  }
+DEFINE_int32(port, 31337, "port to listen or connect");
+DEFINE_string(address, "", "address to connect to");
+DEFINE_bool(gpu, false, "use gpu memory");
+DEFINE_bool(client, false, "run the client");
 
-  arrow::util::ArrowLog::StartArrowLog("ucxpoc", arrow::util::ArrowLogLevel::ARROW_DEBUG);
-
-  auto flight_server =
-      std::make_shared<arrow::flight::FlightServerWithUCXData>("ucx://127.0.0.1:0");
-  auto location = *arrow::flight::Location::ForGrpcTcp("0.0.0.0", 0);
+arrow::Status run_server(const std::string& addr, const int port, const bool use_gpu) {
+  const std::string command = use_gpu ? "gpu" : "cpu";
+  auto flight_server = std::make_shared<arrow::flight::FlightServerWithUCXData>("ucx://127.0.0.1:0");
+  auto location = *arrow::flight::Location::ForGrpcTcp(addr, port);
   arrow::flight::FlightServerOptions options(location);
 
-  ARROW_CHECK_OK(flight_server->Init(options));
-  ARROW_CHECK_OK(flight_server->SetShutdownOnSignals({SIGTERM}));
+  RETURN_NOT_OK(flight_server->Init(options));
+  RETURN_NOT_OK(flight_server->SetShutdownOnSignals({SIGTERM}));
 
-  std::thread serving(&arrow::flight::FlightServerWithUCXData::Serve,
-                      flight_server.get());
+  std::cout << "Flight Server Listening on " << flight_server->location().ToString() << std::endl;
 
-  auto client = *arrow::flight::FlightClient::Connect(flight_server->location());
+  return flight_server->Serve();
+}
 
-  auto info = *client->GetFlightInfo(arrow::flight::FlightDescriptor::Command(command));
+arrow::Status run_client(const std::string& addr, const int port, const bool use_gpu) {
+  const std::string command = use_gpu ? "gpu" : "cpu";
+  auto location = *arrow::flight::Location::ForGrpcTcp(addr, port);
+  ARROW_ASSIGN_OR_RAISE(auto client, arrow::flight::FlightClient::Connect(location));
+
+  ARROW_ASSIGN_OR_RAISE(auto info, client->GetFlightInfo(arrow::flight::FlightDescriptor::Command(command)));
   std::cout << info->endpoints()[0].locations[0].ToString() << std::endl;
 
   std::shared_ptr<arrow::Device> device = arrow::CPUDevice::Instance();
-  if (command == "gpu") {
-    device = *(*arrow::cuda::CudaDeviceManager::Instance())->GetDevice(0);
+  if (use_gpu) {
+    ARROW_ASSIGN_OR_RAISE(auto cuda_mgr, arrow::cuda::CudaDeviceManager::Instance());
+    ARROW_ASSIGN_OR_RAISE(device, cuda_mgr->GetDevice(0));
+
+    ARROW_ASSIGN_OR_RAISE(auto cuda_device, arrow::cuda::AsCudaDevice(device));
+    ARROW_ASSIGN_OR_RAISE(auto ctx, cuda_device->GetContext());
+    cuCtxPushCurrent(reinterpret_cast<CUcontext>(ctx->handle()));
   }
 
-  arrow::ucx::UcxClient ucx_client;
-  ARROW_CHECK_OK(ucx_client.Init(info->endpoints()[0].locations[0]));
-  auto conn = *ucx_client.Get();
+  std::cout << device->ToString() << std::endl;
 
+  arrow::ucx::UcxClient ucx_client;
+  RETURN_NOT_OK(ucx_client.Init(info->endpoints()[0].locations[0]));
+  ARROW_ASSIGN_OR_RAISE(auto conn, ucx_client.Get());
   const auto rkey_buf = info->app_metadata();
 
   auto tkt = info->endpoints()[0].ticket;
   arrow::ucx::Requester req{&conn, device};
 
-  auto rdr = req.GetData(tkt, rkey_buf).ValueOrDie();
-  auto sc = *rdr->GetSchema();
+  ARROW_ASSIGN_OR_RAISE(auto rdr, req.GetData(tkt, rkey_buf));
+  ARROW_ASSIGN_OR_RAISE(auto sc, rdr->GetSchema());
   std::cout << sc->ToString() << std::endl;
 
-  auto rec = rdr->ReadNext().ValueOrDie();
+  ARROW_ASSIGN_OR_RAISE(auto rec, rdr->ReadNext());
   if (command == "gpu") {
-    rec = arrow::cuda::CopyToHost(*rec).ValueOrDie();
+    ARROW_ASSIGN_OR_RAISE(rec, arrow::cuda::CopyToHost(*rec));
   }
   std::cout << rec->ToString() << std::endl;
+  
+  RETURN_NOT_OK(ucx_client.Put(std::move(conn)));
+  RETURN_NOT_OK(ucx_client.Close());
+  return arrow::Status::OK();
+}
 
-  // lots of "error during flush: Connection reset by remote peer"
-  // i'm sure it's probably something i've overlooked but not worrying about it
-  // for the purposes of this POC
-  ARROW_CHECK_OK(ucx_client.Put(std::move(conn)));
-  ARROW_CHECK_OK(ucx_client.Close());
-  ARROW_CHECK_OK(flight_server->Shutdown());
-  serving.join();
+int main(int argc, char** argv) {
+  arrow::util::ArrowLog::StartArrowLog("ucxpoc", arrow::util::ArrowLogLevel::ARROW_DEBUG);
+
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
+  if (FLAGS_client) {
+    ARROW_CHECK_OK(run_client(FLAGS_address, FLAGS_port, FLAGS_gpu));
+  } else {
+    ARROW_CHECK_OK(run_server(FLAGS_address, FLAGS_port, FLAGS_gpu));
+  }
 }
