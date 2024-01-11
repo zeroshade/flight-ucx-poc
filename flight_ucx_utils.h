@@ -25,10 +25,20 @@
 #include "arrow/result.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/uri.h"
+#include "arrow/util/ubsan.h"
+#include "arrow/util/endian.h"
 
 namespace arrow {
 
 namespace ucx {
+
+static inline void Uint32ToBytesLE(const uint32_t in, uint8_t* out) {
+  util::SafeStore(out, bit_util::ToLittleEndian(in));
+}
+
+static inline uint32_t BytesToUint32LE(const uint8_t* in) {
+  return bit_util::FromLittleEndian(util::SafeLoadAs<uint32_t>(in));
+}
 
 class UcpContext final {
  public:

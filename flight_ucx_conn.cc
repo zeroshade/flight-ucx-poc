@@ -150,6 +150,73 @@ Status Connection::SendAM(unsigned int id, const void* header, const size_t head
   return CompleteRequestBlocking("ucp_am_send_nbx", request);
 }
 
+Status Connection::SendTagMsgIov(ucp_tag_t tag, const ucp_dt_iov_t* iov,
+                                 const size_t iov_cnt, void* user_data,
+                                 ucp_send_nbx_callback_t cb,
+                                 const ucs_memory_type_t memory_type) {
+  RETURN_NOT_OK(CheckClosed());
+
+  ucp_request_param_t request_param;
+  request_param.op_attr_mask = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FIELD_CALLBACK |
+                               UCP_OP_ATTR_FIELD_USER_DATA |
+                               UCP_OP_ATTR_FIELD_MEMORY_TYPE;
+  request_param.datatype = UCP_DATATYPE_IOV;
+  request_param.cb.send = cb;
+  request_param.user_data = user_data;
+  request_param.memory_type = memory_type;
+
+  void* request = ucp_tag_send_nbx(remote_endpoint_, iov, iov_cnt, tag, &request_param);
+  if (!request) {
+    // request completed immediately, call callback manually
+    cb(request, UCS_OK, user_data);
+  } else if (UCS_PTR_IS_ERR(request)) {
+    cb(request, UCS_PTR_STATUS(request), user_data);
+    return FromUcsStatus("ucp_tag_send_nbx", UCS_PTR_STATUS(request));
+  }
+
+  return Status::OK();
+}
+
+Status Connection::SendTagData(ucp_tag_t tag, const void* buffer, const size_t count,
+                               void* user_data, ucp_send_nbx_callback_t cb,
+                               const ucs_memory_type_t memory_type) {
+  RETURN_NOT_OK(CheckClosed());
+
+  ucp_request_param_t request_param;
+  request_param.op_attr_mask = UCP_OP_ATTR_FIELD_DATATYPE |
+                               UCP_OP_ATTR_FIELD_MEMORY_TYPE;
+  request_param.datatype = ucp_dt_make_contig(1);
+  request_param.memory_type = memory_type;
+  if (cb != nullptr) {
+    request_param.op_attr_mask |= UCP_OP_ATTR_FIELD_CALLBACK;
+    request_param.cb.send = cb;
+  }
+  if (user_data != nullptr) {
+    request_param.op_attr_mask |= UCP_OP_ATTR_FIELD_USER_DATA;
+    request_param.user_data = user_data;
+  }
+
+  void* request = ucp_tag_send_nbx(remote_endpoint_, buffer, count, tag, &request_param);
+  if (!request) {
+    cb(request, UCS_OK, user_data);
+  } else if (UCS_PTR_IS_ERR(request)) {
+    cb(request, UCS_PTR_STATUS(request), user_data);
+    return FromUcsStatus("ucp_tag_send_nbx", UCS_PTR_STATUS(request));
+  }
+
+  return Status::OK();
+}
+
+Status Connection::SendTagSync(ucp_tag_t tag, const void* buffer, const size_t count) {
+  RETURN_NOT_OK(CheckClosed());
+
+  ucp_request_param_t request_param;
+  ucs_status_ptr_t request =
+      ucp_tag_send_sync_nbx(remote_endpoint_, buffer, count, tag, &request_param);
+  // return FromUcsStatus("ucp_tag_send_sync_nbx", UCS_PTR_STATUS(request));
+  return CompleteRequestBlocking("ucp_tag_send_sync_nbx", request);
+}
+
 Status Connection::SendAMIov(unsigned int id, const void* header,
                              const size_t header_length, const ucp_dt_iov_t* iov,
                              const size_t iov_cnt, void* user_data,
@@ -189,6 +256,28 @@ Status Connection::SendStream(const void* data, const size_t length) {
 
   void* request = ucp_stream_send_nbx(remote_endpoint_, data, length, &request_param);
   return CompleteRequestBlocking("ucp_stream_send_nbx", request);
+}
+
+Status Connection::RecvTagData(ucp_tag_message_h msg, void* buffer, const size_t count,
+                               void* user_data, ucp_tag_recv_nbx_callback_t cb,
+                               const ucs_memory_type_t memory_type) {
+  ucp_request_param_t recv_param;
+  recv_param.op_attr_mask = UCP_OP_ATTR_FIELD_DATATYPE | UCP_OP_ATTR_FLAG_NO_IMM_CMPL |
+                            UCP_OP_ATTR_FIELD_MEMORY_TYPE;
+  recv_param.datatype = ucp_dt_make_contig(1);
+  recv_param.memory_type = memory_type;
+  if (user_data) {
+    recv_param.user_data = user_data;
+    recv_param.op_attr_mask |= UCP_OP_ATTR_FIELD_USER_DATA;
+  }
+  if (cb) {
+    recv_param.cb.recv = cb;
+    recv_param.op_attr_mask |= UCP_OP_ATTR_FIELD_CALLBACK;
+  }
+
+  auto request =
+      ucp_tag_msg_recv_nbx(ucp_worker_->get(), buffer, count, msg, &recv_param);
+  return CompleteRequestBlocking("ucp_tag_msg_recv_nbx", request);
 }
 
 ucs_status_t Connection::RecvAM(std::promise<std::unique_ptr<Buffer>> p,
@@ -271,7 +360,7 @@ Result<ucs_status_t> Connection::RecvActiveMessageImpl(
 
   if (param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) {
     // rendezvous protocol
-    ARROW_ASSIGN_OR_RAISE(auto buffer, memory_manager_->AllocateBuffer(data_length));
+    ARROW_ASSIGN_OR_RAISE(auto buffer, memory_manager()->AllocateBuffer(data_length));
 
     ucp_request_param_t recv_param;
     recv_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_MEMORY_TYPE |
@@ -296,14 +385,14 @@ Result<ucs_status_t> Connection::RecvActiveMessageImpl(
 
   std::unique_ptr<Buffer> buffer;
   // data will be freed after callback returns - copy to buffer
-  if (memory_manager_->is_cpu()) {
-    ARROW_ASSIGN_OR_RAISE(buffer, memory_manager_->AllocateBuffer(data_length));
+  if (memory_manager()->is_cpu()) {
+    ARROW_ASSIGN_OR_RAISE(buffer, memory_manager()->AllocateBuffer(data_length));
     std::memcpy(buffer->mutable_data(), data, data_length);
   } else {
     ARROW_ASSIGN_OR_RAISE(
         buffer, MemoryManager::CopyNonOwned(Buffer(reinterpret_cast<uint8_t*>(data),
                                                    static_cast<int64_t>(data_length)),
-                                            memory_manager_));
+                                            memory_manager()));
   }
 
   p.set_value(std::move(buffer));

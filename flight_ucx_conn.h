@@ -36,6 +36,13 @@ class Connection {
   ARROW_DEFAULT_MOVE_AND_ASSIGN(Connection);
   ~Connection() { DCHECK(!ucp_worker_) << "Connection was not closed!"; }
 
+  inline std::shared_ptr<MemoryManager> memory_manager() const {
+    if (memory_manager_) {
+      return memory_manager_;
+    }
+    return CPUDevice::Instance()->default_memory_manager();
+  }
+
   inline void set_memory_manager(std::shared_ptr<MemoryManager> mm) {
     if (mm) {
       memory_manager_ = std::move(mm);
@@ -59,6 +66,16 @@ class Connection {
                       const size_t header_length, void* data, const size_t data_length,
                       const ucp_am_recv_param_t* param);
   Status RecvStream(const void* buffer, const size_t capacity, size_t* length);
+  Status RecvTagData(ucp_tag_message_h msg, void* buffer, const size_t count,
+                     void* user_data, ucp_tag_recv_nbx_callback_t cb,
+                     const ucs_memory_type_t memory_type);
+  Status SendTagMsgIov(ucp_tag_t tag, const ucp_dt_iov_t* iov, const size_t iov_cnt,
+                       void* user_data, ucp_send_nbx_callback_t cb,
+                       const ucs_memory_type_t memory_type);
+  Status SendTagSync(ucp_tag_t tag, const void* buffer, const size_t count);
+  Status SendTagData(ucp_tag_t tag, const void* buffer, const size_t count,
+                     void* user_data, ucp_send_nbx_callback_t cb,
+                     const ucs_memory_type_t memory_type);
 
   Status SetAMHandler(const ucp_am_handler_param_t* param) {
     return FromUcsStatus("ucp_worker_set_am_recv_handler",

@@ -21,12 +21,13 @@
 #include "random_generation.h"
 #include "ucx_mmap_alloc.h"
 
+#include <gflags/gflags.h>
 #include <signal.h>
 #include <ucp/api/ucp.h>
 #include <future>
 #include <iostream>
 #include <memory>
-#include <gflags/gflags.h>
+#include <unordered_map>
 
 #include "arrow/buffer.h"
 #include "arrow/flight/client.h"
@@ -39,6 +40,8 @@
 
 static constexpr uint32_t kTicketAmHandlerId = 0xCAFE;
 static constexpr uint32_t kEndStream = 0xDEADBEEF;
+static constexpr ucp_tag_t kWantDataTag = 0xEBBEDDEADBA0BAB0;
+static constexpr ucp_tag_t kFreeDataTag = 0x0000F4EEDA7A0000;
 
 namespace arrow {
 
@@ -66,32 +69,16 @@ class UcxStreamReader {
     }
   }
 
-  Status SetHandlers() {
+  Status Start(flight::Ticket& tkt) {
     ucp_am_handler_param_t params;
-    params.field_mask = UCP_AM_HANDLER_PARAM_FIELD_ARG | UCP_AM_HANDLER_PARAM_FIELD_ID |
-                        UCP_AM_HANDLER_PARAM_FIELD_CB | UCP_AM_HANDLER_PARAM_FIELD_FLAGS;
-    // params.flags = UCP_AM_FLAG_PERSISTENT_DATA;
+    params.field_mask = UCP_AM_HANDLER_PARAM_FIELD_ARG | UCP_AM_HANDLER_PARAM_FIELD_CB |
+                        UCP_AM_HANDLER_PARAM_FIELD_ID | UCP_AM_HANDLER_PARAM_FIELD_FLAGS;
     params.arg = this;
-    params.id = static_cast<unsigned int>(ipc::MessageType::SCHEMA);
-    params.cb = RecvSchemaMsg;
+    params.id = 0;
+    params.cb = RecvMsg;
     RETURN_NOT_OK(cnxn_->SetAMHandler(&params));
+    RETURN_NOT_OK(cnxn_->SendTagSync(kWantDataTag, tkt.ticket.data(), tkt.ticket.size()));
 
-    params.id = static_cast<unsigned int>(ipc::MessageType::RECORD_BATCH);
-    params.cb = RecvRecordBatchMsg;
-    RETURN_NOT_OK(cnxn_->SetAMHandler(&params));
-
-    params.id = RMA_RECORD_BATCH_ID;
-    params.cb = RecvMappedRecordBatchMsg;
-    RETURN_NOT_OK(cnxn_->SetAMHandler(&params));
-
-    params.id = kEndStream;
-    params.cb = RecvEosMsg;
-    RETURN_NOT_OK(cnxn_->SetAMHandler(&params));
-
-    return Status::OK();
-  }
-
-  arrow::Result<std::shared_ptr<Schema>> GetSchema() {
     std::thread([this] {
       if (arrow::cuda::IsCudaMemoryManager(*rndv_mem_mgr_)) {
         auto ctx = *(*arrow::cuda::AsCudaMemoryManager(rndv_mem_mgr_))
@@ -99,48 +86,229 @@ class UcxStreamReader {
                         ->GetContext();
         cuCtxPushCurrent(reinterpret_cast<CUcontext>(ctx->handle()));
       }
+
       while (true) {
         if (cnxn_->MakeProgress()) {
           cv_progress_.notify_all();
         }
-        if (finished_.load()) {
-          std::lock_guard lock(stream_lock_);
-          if (queue_.empty() && outstanding_rndv_.load() == 0) {
-            break;
-          }
+        if (finished_.load() && outstanding_rndv_.load() == 0) {
+          // std::lock_guard lock(stream_lock_);
+          break;
+        }
+        if (ucp_worker_wait(cnxn_->worker()->get()) != UCS_OK) {
+          break;
         }
       }
     }).detach();
 
-    std::unique_lock<std::mutex> lock(stream_lock_);
+    std::thread([this] {
+      if (arrow::cuda::IsCudaMemoryManager(*rndv_mem_mgr_)) {
+        auto ctx = *(*arrow::cuda::AsCudaMemoryManager(rndv_mem_mgr_))
+                        ->cuda_device()
+                        ->GetContext();
+        cuCtxPushCurrent(reinterpret_cast<CUcontext>(ctx->handle()));
+      }
+
+      while (true) {
+        std::future<std::unique_ptr<Buffer>> buf;
+        {
+          std::unique_lock<std::mutex> lock(queue_mutex_);
+          if (msg_queue_.empty()) {
+            if (finished_.load()) {
+              return;
+            }
+            cv_progress_.wait(lock,
+                              [this] { return !msg_queue_.empty() || finished_.load(); });
+          }
+          buf = std::move(msg_queue_.front());
+          msg_queue_.pop();
+        }
+        std::shared_ptr<Buffer> buffer = buf.get();
+        auto metadata = SliceBuffer(buffer, 0, buffer->size() - 4);
+        if (metadata->data_as<uint32_t>()[0] == 0xFFFFFFFF) {
+          finished_.store(true);
+          continue;
+        }
+
+        uint32_t sequence_number = BytesToUint32LE(buffer->data() + metadata->size());
+        std::promise<std::unique_ptr<ipc::Message>> p;
+        {
+          std::lock_guard<std::mutex> lock(msg_mutex_);
+          msg_map_.insert({sequence_number, p.get_future()});
+        }
+        cv_progress_.notify_all();
+
+        auto msg = ipc::Message::Open(metadata, nullptr).ValueOrDie();
+        if (!ipc::Message::HasBody(msg->type())) {
+          p.set_value(std::move(msg));
+          continue;
+        }
+
+        ucp_tag_t tag = (static_cast<uint64_t>(msg->type()) << 56) |
+                        bit_util::ToLittleEndian(sequence_number);
+        {
+          std::lock_guard<std::mutex> lock(tag_polling_mutex_);
+          tags_to_poll_.insert({tag, PendingMsg{std::move(p), std::move(metadata)}});
+        }
+        cv_progress_.notify_all();
+      }
+    }).detach();
+
+    std::thread([this] {
+      if (arrow::cuda::IsCudaMemoryManager(*rndv_mem_mgr_)) {
+        auto ctx = *(*arrow::cuda::AsCudaMemoryManager(rndv_mem_mgr_))
+                        ->cuda_device()
+                        ->GetContext();
+        cuCtxPushCurrent(reinterpret_cast<CUcontext>(ctx->handle()));
+      }
+
+      while (true) {
+        {
+          std::unique_lock<std::mutex> lock(tag_polling_mutex_);
+          if (tags_to_poll_.empty()) {
+            if (finished_.load()) {
+              return;
+            }
+            cv_progress_.wait(
+                lock, [this] { return !tags_to_poll_.empty() || finished_.load(); });
+          }
+
+          ucp_tag_recv_info_t info_tag;
+          ucp_tag_message_h msg_tag;
+          for (auto it = tags_to_poll_.begin(); it != tags_to_poll_.end();) {
+            msg_tag = ucp_tag_probe_nb(cnxn_->worker()->get(), it->first,
+                                       0xFF000000000000FF, 1, &info_tag);
+            if (msg_tag != nullptr) {
+              // got it! do something
+              auto st = RecvTag(msg_tag, info_tag, std::move(it->second));
+              if (!st.ok()) {
+                st.Abort();
+              }
+              it = tags_to_poll_.erase(it);
+            } else {
+              ++it;
+            }
+          }
+        }
+        // cnxn_->MakeProgress();
+      }
+    }).detach();
+
+    return Status::OK();
+  }
+
+  Status SetHandlers() {
+    // ucp_am_handler_param_t params;
+    // params.field_mask = UCP_AM_HANDLER_PARAM_FIELD_ARG | UCP_AM_HANDLER_PARAM_FIELD_ID
+    // |
+    //                     UCP_AM_HANDLER_PARAM_FIELD_CB |
+    //                     UCP_AM_HANDLER_PARAM_FIELD_FLAGS;
+    // // params.flags = UCP_AM_FLAG_PERSISTENT_DATA;
+    // params.arg = this;
+    // params.id = static_cast<unsigned int>(ipc::MessageType::SCHEMA);
+    // params.cb = RecvSchemaMsg;
+    // RETURN_NOT_OK(cnxn_->SetAMHandler(&params));
+
+    // params.id = static_cast<unsigned int>(ipc::MessageType::RECORD_BATCH);
+    // params.cb = RecvRecordBatchMsg;
+    // RETURN_NOT_OK(cnxn_->SetAMHandler(&params));
+
+    // params.id = RMA_RECORD_BATCH_ID;
+    // params.cb = RecvMappedRecordBatchMsg;
+    // RETURN_NOT_OK(cnxn_->SetAMHandler(&params));
+
+    // params.id = kEndStream;
+    // params.cb = RecvEosMsg;
+    // RETURN_NOT_OK(cnxn_->SetAMHandler(&params));
+
+    return Status::OK();
+  }
+
+  arrow::Result<std::shared_ptr<Schema>> GetSchema() {
     if (schema_) {
       return schema_;
     }
 
-    cv_progress_.wait(lock, [this] { return finished_.load() || schema_ != nullptr; });
-
+    ARROW_ASSIGN_OR_RAISE(auto msg, ReadNextMsg());
+    ARROW_ASSIGN_OR_RAISE(schema_, ipc::ReadSchema(*msg, &dictionary_memo_));
     return schema_;
+
+    // std::thread([this] {
+    //   if (arrow::cuda::IsCudaMemoryManager(*rndv_mem_mgr_)) {
+    //     auto ctx = *(*arrow::cuda::AsCudaMemoryManager(rndv_mem_mgr_))
+    //                     ->cuda_device()
+    //                     ->GetContext();
+    //     cuCtxPushCurrent(reinterpret_cast<CUcontext>(ctx->handle()));
+    //   }
+    //   while (true) {
+    //     if (cnxn_->MakeProgress()) {
+    //       cv_progress_.notify_all();
+    //     }
+    //     if (finished_.load()) {
+    //       std::lock_guard lock(stream_lock_);
+    //       if (queue_.empty() && outstanding_rndv_.load() == 0) {
+    //         break;
+    //       }
+    //     }
+    //   }
+    // }).detach();
+
+    // std::unique_lock<std::mutex> lock(stream_lock_);
+    // if (schema_) {
+    //   return schema_;
+    // }
+
+    // cv_progress_.wait(lock, [this] { return finished_.load() || schema_ != nullptr; });
+
+    // return schema_;
   }
 
   arrow::Result<std::shared_ptr<RecordBatch>> ReadNext() {
-    std::future<processed_rb> out;
-    {
-      std::unique_lock<std::mutex> lock(stream_lock_);
-      if (queue_.empty()) {
-        if (finished_.load()) {
-          return Status::Cancelled("completed");
-        }
+    ARROW_ASSIGN_OR_RAISE(auto msg, ReadNextMsg());
+    return ipc::ReadRecordBatch(*msg, schema_, &dictionary_memo_, ipc_options_);
+    // std::future<processed_rb> out;
+    // {
+    //   std::unique_lock<std::mutex> lock(stream_lock_);
+    //   if (queue_.empty()) {
+    //     if (finished_.load()) {
+    //       return Status::Cancelled("completed");
+    //     }
 
-        cv_progress_.wait(lock, [this] { return !queue_.empty() || finished_.load(); });
-      }
+    //     cv_progress_.wait(lock, [this] { return !queue_.empty() || finished_.load();
+    //     });
+    //   }
 
-      out = std::move(queue_.front());
-      queue_.pop();
-    }
-    return out.get();
+    //   out = std::move(queue_.front());
+    //   queue_.pop();
+    // }
+    // return out.get();
   }
 
  protected:
+  Result<std::unique_ptr<ipc::Message>> ReadNextMsg() {
+    std::future<std::unique_ptr<ipc::Message>> futr;
+    {
+      std::unique_lock<std::mutex> lock(msg_mutex_);
+
+      const uint32_t counter = next_counter_++;
+      auto it = msg_map_.find(counter);
+      if (it == msg_map_.end()) {
+        cv_progress_.wait(lock, [this, counter, &it] {
+          it = msg_map_.find(counter);
+          return it != msg_map_.end() || finished_.load();
+        });
+      }
+      futr = std::move(it->second);
+      msg_map_.erase(it);
+    }
+
+    // while (futr.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+    //   cnxn_->MakeProgress();
+    // }
+
+    return futr.get();
+  }
+
   using processed_rb = arrow::Result<std::shared_ptr<RecordBatch>>;
   struct PendingDataRecv {
     std::promise<processed_rb> promise;
@@ -148,6 +316,157 @@ class UcxStreamReader {
     std::unique_ptr<Buffer> buffer;
     UcxStreamReader* rdr;
   };
+
+  struct PendingMsg {
+    std::promise<std::unique_ptr<ipc::Message>> p;
+    std::shared_ptr<Buffer> metadata;
+    std::shared_ptr<Buffer> body;
+    UcxStreamReader* rdr;
+  };
+
+  static constexpr uint64_t kbody_mask_ = 0x80000000000000;
+
+  Status RecvTag(ucp_tag_message_h msg, ucp_tag_recv_info_t info_tag,
+                 PendingMsg pending) {
+    std::unique_ptr<Buffer> buf;
+    if (info_tag.sender_tag & kbody_mask_) {
+      ARROW_ASSIGN_OR_RAISE(
+          buf, CPUDevice::Instance()->default_memory_manager()->AllocateBuffer(
+                   info_tag.length));
+    } else {
+      ARROW_ASSIGN_OR_RAISE(buf, rndv_mem_mgr_->AllocateBuffer(info_tag.length));
+    }
+    ++outstanding_rndv_;
+
+    PendingMsg* new_pending = new PendingMsg(std::move(pending));
+    new_pending->body = std::move(buf);
+    new_pending->rdr = this;
+    return cnxn_->RecvTagData(
+        msg, reinterpret_cast<void*>(new_pending->body->address()), info_tag.length,
+        new_pending,
+        [](void* request, ucs_status_t status, const ucp_tag_recv_info_t* tag_info,
+           void* user_data) {
+          PendingMsg* pending = reinterpret_cast<PendingMsg*>(user_data);
+          if (status != UCS_OK) {
+            ARROW_LOG(WARNING)
+                << FromUcsStatus("ucp_tag_recv_nbx_callback", status).ToString();
+            pending->p.set_value(nullptr);
+            ucp_request_free(request);
+            delete pending;
+            return;
+          }
+
+          ucp_request_free(request);
+
+          if (tag_info->sender_tag & kbody_mask_) {
+            std::thread(&UcxStreamReader::RecvMappedBody, pending->rdr,
+                        std::move(pending->p), std::move(pending->metadata),
+                        std::move(pending->body))
+                .detach();
+          } else {
+            auto msg = *ipc::Message::Open(pending->metadata, pending->body);
+            pending->p.set_value(std::move(msg));
+            --pending->rdr->outstanding_rndv_;
+          }
+
+          delete pending;
+        },
+        (new_pending->body->is_cpu()) ? UCS_MEMORY_TYPE_HOST : UCS_MEMORY_TYPE_CUDA);
+  }
+
+  void RecvMappedBody(std::promise<std::unique_ptr<ipc::Message>> p,
+                      std::shared_ptr<Buffer> metadata, std::shared_ptr<Buffer> in_buf) {
+    ucp_rkey_h rkey;
+    auto status = ucp_ep_rkey_unpack(cnxn_->endpoint(), rkey_buf_.data(), &rkey);
+    if (status != UCS_OK) {
+      ucp_rkey_destroy(rkey);
+      ARROW_LOG(WARNING) << FromUcsStatus("ucp_ep_rkey_unpack", status).ToString();
+      return;
+    }
+
+    auto* buffers =
+        reinterpret_cast<const std::pair<uint64_t, uint64_t>*>(in_buf->data_as<void>());
+    uint64_t total_size = buffers[0].first;
+    uint64_t num_bufs = buffers[0].second;
+    buffers++;
+
+    if (arrow::cuda::IsCudaMemoryManager(*rndv_mem_mgr_)) {
+      auto ctx = *(*arrow::cuda::AsCudaMemoryManager(rndv_mem_mgr_))
+                      ->cuda_device()
+                      ->GetContext();
+      cuCtxPushCurrent(reinterpret_cast<CUcontext>(ctx->handle()));
+    }
+
+    auto outbuf = *rndv_mem_mgr_->AllocateBuffer(total_size);
+    void* outptr = reinterpret_cast<void*>(outbuf->mutable_address());
+    if (outbuf->is_cpu()) {
+      std::memset(outptr, 0, outbuf->size());
+    } else {
+      cuMemsetD8(outbuf->mutable_address(), 0, outbuf->size());
+    }
+
+    uint64_t offset = 0;
+
+    ucp_request_param_t param;
+    param.op_attr_mask = UCP_OP_ATTR_FIELD_MEMORY_TYPE | UCP_OP_ATTR_FIELD_CALLBACK |
+                         UCP_OP_ATTR_FIELD_USER_DATA;
+    param.cb.send = logging_callback;
+    param.memory_type = (outbuf->is_cpu()) ? UCS_MEMORY_TYPE_HOST : UCS_MEMORY_TYPE_CUDA;
+
+    std::vector<uint64_t> addresses;
+    for (auto* p = buffers; p != buffers + num_bufs; p++) {
+      if (p->first == 0) {
+        offset += p->second;
+        continue;
+      }
+
+      addresses.push_back(p->first);
+      param.user_data = reinterpret_cast<void*>(std::distance(buffers, p));
+      auto status = ucp_get_nbx(cnxn_->endpoint(), UCS_PTR_BYTE_OFFSET(outptr, offset),
+                                p->second, p->first, rkey, &param);
+      if (UCS_PTR_IS_ERR(status)) {
+        ucp_rkey_destroy(rkey);
+        ARROW_LOG(WARNING)
+            << FromUcsStatus("ucp_get_nbx", UCS_PTR_STATUS(status)).ToString();
+        return;
+      }
+      offset += p->second;
+    }
+
+    auto flush_status = cnxn_->Flush();
+    if (!flush_status.ok()) {
+      ucp_rkey_destroy(rkey);
+      ARROW_LOG(WARNING) << flush_status.ToString();
+      return;
+    }
+
+    ucp_rkey_destroy(rkey);
+
+    auto free_status = cnxn_->SendTagSync(kFreeDataTag, reinterpret_cast<void*>(addresses.data()),
+                       addresses.size() * sizeof(uint64_t));
+    if (!free_status.ok()) {
+      ARROW_LOG(WARNING) << free_status.ToString();
+    }
+
+    auto msg = *ipc::Message::Open(metadata, std::move(outbuf));
+    p.set_value(std::move(msg));
+    --outstanding_rndv_;
+  }
+
+  static ucs_status_t RecvMsg(void* arg, const void* header, size_t header_length,
+                              void* data, size_t length,
+                              const ucp_am_recv_param_t* param) {
+    UcxStreamReader* rdr = reinterpret_cast<UcxStreamReader*>(arg);
+    DCHECK(length);
+
+    std::promise<std::unique_ptr<Buffer>> p;
+    {
+      std::lock_guard<std::mutex> lock(rdr->queue_mutex_);
+      rdr->msg_queue_.push(p.get_future());
+    }
+
+    return rdr->cnxn_->RecvAM(std::move(p), header, header_length, data, length, param);
+  }
 
   static ucs_status_t RecvSchemaMsg(void* arg, const void* header, size_t header_length,
                                     void* data, size_t length,
@@ -428,7 +747,7 @@ class UcxStreamReader {
   }
 
  private:
-  Connection* cnxn_;  
+  Connection* cnxn_;
   std::string rkey_buf_;
   std::atomic<bool> finished_{false};
   std::condition_variable cv_progress_;
@@ -444,6 +763,15 @@ class UcxStreamReader {
 
   std::shared_ptr<MemoryManager> rndv_mem_mgr_{
       CPUDevice::Instance()->default_memory_manager()};
+
+  std::mutex tag_polling_mutex_;
+  std::unordered_map<ucp_tag_t, PendingMsg> tags_to_poll_;
+  std::mutex queue_mutex_;
+  std::queue<std::future<std::unique_ptr<Buffer>>> msg_queue_;
+  std::mutex msg_mutex_;
+  std::unordered_map<uint32_t, std::future<std::unique_ptr<ipc::Message>>> msg_map_;
+  uint32_t counter_{0};
+  uint32_t next_counter_{0};
 };
 
 class UcxStreamWriter {
@@ -467,7 +795,7 @@ class UcxStreamWriter {
     ipc::IpcPayload payload;
     RETURN_NOT_OK(ipc::GetSchemaPayload(schema, ipc_options_, mapper_, &payload));
 
-    return WritePayload(payload);
+    return WriteIPC(payload);
   }
 
   Status WriteRecordBatch(const RecordBatch& batch) {
@@ -482,15 +810,17 @@ class UcxStreamWriter {
     // spurious allocations here to pass as IPC. is there a more optimal
     // way to handle this, particularly for non-cpu memory?
     RETURN_NOT_OK(ipc::GetRecordBatchPayload(batch, ipc_options_, &payload));
-    RETURN_NOT_OK(WritePayload(payload));
+    RETURN_NOT_OK(WriteIPC(payload));
     ++stats_.num_record_batches;
     return Status::OK();
   }
 
-  Status WriteMappedRecordBatch(const RecordBatch& batch) {
+  Status WriteMappedRecordBatch(const RecordBatch& batch, BufferVector* buf_keep_alive) {
     if (!started_) {
       return Status::Invalid("writer has not been started yet");
     }
+
+    RETURN_NOT_OK(EnsureDictsWritten(batch));
 
     ipc::IpcPayload payload;
     // the drawback here is that if there are any slices involved here
@@ -499,9 +829,43 @@ class UcxStreamWriter {
     // way to handle this, particularly for non-cpu memory?
     RETURN_NOT_OK(ipc::GetRecordBatchPayload(batch, ipc_options_, &payload));
 
-    unsigned int id = RMA_RECORD_BATCH_ID;
-    const void* header = payload.metadata->data_as<void>();
-    const size_t header_length = payload.metadata->size();
+    ucs_memory_type_t mem_type = UCS_MEMORY_TYPE_HOST;
+
+    ++stats_.num_messages;
+    auto pending = std::make_unique<PendingIOV>();
+    pending->iovs.resize(2);
+    pending->iovs[0].buffer = const_cast<void*>(payload.metadata->data_as<void>());
+    pending->iovs[0].length = payload.metadata->size();
+    pending->body_buffers.emplace_back(payload.metadata);
+
+    pending->iovs[1].buffer = malloc(4);
+    pending->iovs[1].length = 4;
+    Uint32ToBytesLE(sequence_num, reinterpret_cast<uint8_t*>(pending->iovs[1].buffer));
+
+    auto* pending_iov = pending.get();
+    void* user_data = pending.release();
+
+    ARROW_RETURN_NOT_OK(cnxn_->SendAMIov(
+        0, nullptr, 0, pending_iov->iovs.data(), pending_iov->iovs.size(), pending_iov,
+        [](void* request, ucs_status_t status, void* user_data) {
+          auto pending_iov = reinterpret_cast<PendingIOV*>(user_data);
+          if (status != UCS_OK) {
+            ARROW_LOG(WARNING) << FromUcsStatus("ucp_am_send_nbx_cb", status).ToString();
+          }
+          if (request) ucp_request_free(request);
+          free(pending_iov->iovs[1].buffer);
+          delete pending_iov;
+        },
+        mem_type));
+
+    if (!payload.body_buffers.size()) {
+      ++sequence_num;
+      return Status::OK();
+    }
+
+    // unsigned int id = RMA_RECORD_BATCH_ID;
+    // const void* header = payload.metadata->data_as<void>();
+    // const size_t header_length = payload.metadata->size();
 
     std::vector<std::pair<uint64_t, uint64_t>> buffers;
     buffers.emplace_back(payload.body_length, 0);
@@ -509,6 +873,7 @@ class UcxStreamWriter {
     for (const auto& buffer : payload.body_buffers) {
       if (!buffer || buffer->size() == 0) continue;
       buffers.emplace_back(buffer->address(), buffer->size());
+      if (buf_keep_alive) buf_keep_alive->emplace_back(buffer);
       const auto remainder = static_cast<int>(
           bit_util::RoundUpToMultipleOf8(buffer->size()) - buffer->size());
       if (remainder) {
@@ -517,11 +882,26 @@ class UcxStreamWriter {
     }
     buffers[0].second = buffers.size() - 1;
 
-    RETURN_NOT_OK(cnxn_->SendAM(id, header, header_length,
-                                reinterpret_cast<void*>(buffers.data()),
-                                buffers.size() * (2 * sizeof(uint64_t))));
-
-    return Status::OK();
+    ucp_tag_t tag = (static_cast<uint64_t>(payload.type) << 56) | (uint64_t(1) << 55) |
+                    bit_util::ToLittleEndian(sequence_num);
+    ++sequence_num;
+    auto* pending_buffers =
+        new std::vector<std::pair<uint64_t, uint64_t>>(std::move(buffers));
+    return cnxn_->SendTagData(
+        tag, pending_buffers->data(), pending_buffers->size() * (2 * sizeof(uint64_t)),
+        pending_buffers,
+        [](void* request, ucs_status_t status, void* user_data) {
+          auto pending =
+              reinterpret_cast<std::vector<std::pair<uint64_t, uint64_t>>*>(user_data);
+          delete pending;
+          if (status != UCS_OK) {
+            ARROW_LOG(WARNING) << FromUcsStatus("ucp_tag_send_nbx_cb", status).ToString();
+          }
+          if (request) {
+            ucp_request_free(request);
+          }
+        },
+        mem_type);
   }
 
   ipc::WriteStats stats() const { return stats_; }
@@ -532,7 +912,11 @@ class UcxStreamWriter {
     }
 
     RETURN_NOT_OK(cnxn_->Flush());
-    return cnxn_->SendAM(kEndStream, padding_bytes_.data(), 1);
+    std::array<uint8_t, 8> eos_bytes{0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0};
+    uint32_t num = bit_util::ToLittleEndian(sequence_num);
+    std::memcpy(eos_bytes.data() + 4, reinterpret_cast<void*>(&num), 4);
+
+    return cnxn_->SendAM(0, eos_bytes.data(), eos_bytes.size());
   }
 
  private:
@@ -552,6 +936,105 @@ class UcxStreamWriter {
       ++stats_.num_dictionary_batches;
     }
     return Status::OK();
+  }
+
+  Status WriteIPC(const ipc::IpcPayload& payload) {
+    ucs_memory_type_t mem_type = UCS_MEMORY_TYPE_HOST;
+
+    ++stats_.num_messages;
+
+    auto pending = std::make_unique<PendingIOV>();
+    pending->iovs.resize(2);
+    pending->iovs[0].buffer = const_cast<void*>(payload.metadata->data_as<void>());
+    pending->iovs[0].length = payload.metadata->size();
+    pending->body_buffers.emplace_back(payload.metadata);
+
+    pending->iovs[1].buffer = malloc(4);
+    pending->iovs[1].length = 4;
+    Uint32ToBytesLE(sequence_num, reinterpret_cast<uint8_t*>(pending->iovs[1].buffer));
+
+    auto* pending_iov = pending.get();
+    void* user_data = pending.release();
+
+    ARROW_RETURN_NOT_OK(cnxn_->SendAMIov(
+        0, nullptr, 0, pending_iov->iovs.data(), pending_iov->iovs.size(), pending_iov,
+        [](void* request, ucs_status_t status, void* user_data) {
+          auto pending_iov = reinterpret_cast<PendingIOV*>(user_data);
+          if (status != UCS_OK) {
+            ARROW_LOG(WARNING) << FromUcsStatus("ucp_am_send_nbx_cb", status).ToString();
+          }
+          if (request) ucp_request_free(request);
+          free(pending_iov->iovs[1].buffer);
+          delete pending_iov;
+        },
+        mem_type));
+
+    if (!payload.body_buffers.size()) {
+      ++sequence_num;
+      return Status::OK();
+    }
+
+    pending = std::make_unique<PendingIOV>();
+    int32_t total_buffers = 0;
+    for (const auto& buffer : payload.body_buffers) {
+      if (!buffer || buffer->size() == 0) continue;
+
+      if (!buffer->is_cpu()) {
+        mem_type = UCS_MEMORY_TYPE_CUDA;
+      }
+
+      total_buffers++;
+      // arrow ipc requires aligning buffers to 8 byte boundary
+      const auto remainder = static_cast<int>(
+          bit_util::RoundUpToMultipleOf8(buffer->size()) - buffer->size());
+      if (remainder) total_buffers++;
+    }
+
+    pending->iovs.resize(total_buffers);
+    ucp_dt_iov_t* iov = pending->iovs.data();
+    pending->body_buffers = payload.body_buffers;
+
+    void* padding_bytes =
+        const_cast<void*>(reinterpret_cast<const void*>(padding_bytes_.data()));
+    if (mem_type == UCS_MEMORY_TYPE_CUDA) {
+      padding_bytes = const_cast<void*>(
+          reinterpret_cast<const void*>(cuda_padding_bytes_->address()));
+    }
+
+    for (const auto& buffer : payload.body_buffers) {
+      if (!buffer || buffer->size() == 0) continue;
+
+      iov->buffer = const_cast<void*>(reinterpret_cast<const void*>(buffer->address()));
+      iov->length = buffer->size();
+      ++iov;
+
+      const auto remainder = static_cast<int>(
+          bit_util::RoundUpToMultipleOf8(buffer->size()) - buffer->size());
+      if (remainder) {
+        iov->buffer = padding_bytes;
+        iov->length = remainder;
+        ++iov;
+      }
+    }
+
+    pending_iov = pending.release();
+
+    ucp_tag_t tag = (static_cast<uint64_t>(payload.type) << 56) | (uint64_t(0) << 55) |
+                    bit_util::ToLittleEndian(sequence_num);
+    ++sequence_num;
+    return cnxn_->SendTagMsgIov(
+        tag, pending_iov->iovs.data(), pending_iov->iovs.size(), pending_iov,
+        [](void* request, ucs_status_t status, void* user_data) {
+          auto pending_iov = reinterpret_cast<PendingIOV*>(user_data);
+          if (status != UCS_OK) {
+            ARROW_LOG(WARNING) << FromUcsStatus("ucp_tag_send_nbx_cb", status).ToString();
+          }
+          if (request) {
+            ucp_request_free(request);
+          }
+          delete pending_iov;
+        },
+        mem_type);
   }
 
   struct PendingIOV {
@@ -640,6 +1123,8 @@ class UcxStreamWriter {
 
   const std::array<uint8_t, 8> padding_bytes_{0, 0, 0, 0, 0, 0, 0, 0};
   std::unique_ptr<cuda::CudaBuffer> cuda_padding_bytes_;
+
+  uint32_t sequence_num{0};
 };
 
 class Requester {
@@ -650,12 +1135,10 @@ class Requester {
   arrow::Result<std::unique_ptr<UcxStreamReader>> GetData(flight::Ticket& tkt,
                                                           std::string rkey) {
     auto reader = std::make_unique<UcxStreamReader>(cnxn_, rkey);
+    // cnxn_->set_memory_manager(device_->default_memory_manager());
     reader->set_memory_mgr(device_->default_memory_manager());
 
     RETURN_NOT_OK(reader->SetHandlers());
-
-    RETURN_NOT_OK(
-        cnxn_->SendAM(kTicketAmHandlerId, tkt.ticket.data(), tkt.ticket.size()));
     return reader;
   }
 
@@ -759,55 +1242,60 @@ class DataServer : public UcxServer {
   }
 
   Status do_work(UcxServer::ClientWorker* worker) override {
-    std::future<std::unique_ptr<Buffer>> fut;
-    {
-      std::lock_guard<std::mutex> lock(worker->queue_mutex_);
-      if (worker->buffer_queue_.empty()) {
-        return Status::OK();
+    ucp_tag_recv_info_t info_tag;
+    ucp_tag_message_h msg_tag;
+    while (true) {
+      msg_tag = ucp_tag_probe_nb(worker->worker_->get(), kWantDataTag, UINT64_MAX, 1,
+                                 &info_tag);
+      if (msg_tag != nullptr) {
+        // we got one!
+        break;
+      } else if (ucp_worker_progress(worker->worker_->get())) {
+        // some events polled, try again
+        continue;
       }
-      fut = std::move(worker->buffer_queue_.front());
-      worker->buffer_queue_.pop();
+
+      // ucp_worker_progress was 0, so we sleep
+      // following blocked method used to polling internal file descriptor
+      // to make CPU idle and not spin loop
+      ARROW_RETURN_NOT_OK(
+          FromUcsStatus("ucp_worker_wait", ucp_worker_wait(worker->worker_->get())));
     }
 
-    while (fut.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
-      ucp_worker_progress(worker->worker_->get());
-    }
+    auto mm = worker->conn_->memory_manager();
+    ARROW_ASSIGN_OR_RAISE(auto msg_buf, mm->AllocateBuffer(info_tag.length));
+    ARROW_RETURN_NOT_OK(worker->conn_->RecvTagData(
+        msg_tag, reinterpret_cast<void*>(msg_buf->address()), info_tag.length, nullptr,
+        nullptr, UCS_MEMORY_TYPE_HOST));
 
-    auto buf = fut.get();
-    std::cout << buf->ToString() << std::endl;
+    std::cout << msg_buf->ToString() << std::endl;
 
-    // auto memh = mapped_pool_->get_mem_handle();
-    // ucp_memh_pack_params_t params;
-    // void* rkey_buffer;
-    // size_t rkey_size;
-    // ucs_status_t status = ucp_rkey_pack(worker->worker_->context().get(), memh,
-    // &rkey_buffer, &rkey_size); if (status != UCS_OK) {
-    //   return FromUcsStatus("ucp_memh_pack", status);
+    // std::future<std::unique_ptr<Buffer>> fut;
+    // {
+    //   std::lock_guard<std::mutex> lock(worker->queue_mutex_);
+    //   if (worker->buffer_queue_.empty()) {
+    //     return Status::OK();
+    //   }
+    //   fut = std::move(worker->buffer_queue_.front());
+    //   worker->buffer_queue_.pop();
     // }
 
-    // // auto* exported_memh = mapped_pool_->get_exported_memh();
-    // ucp_rkey_h rkey;
-    // status = ucp_ep_rkey_unpack(worker->conn_->endpoint(), rkey_buffer, &rkey);
-    // if (status != UCS_OK) {
-    //   return FromUcsStatus("ucp_ep_rkey_unpack", status);
+    // while (fut.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+    //   ucp_worker_progress(worker->worker_->get());
     // }
 
-    // auto addr = sample_record_batch_->column(0)->data()->buffers[1]->address();
-    // void* ptr = nullptr;
-    // status = ucp_rkey_ptr(rkey, reinterpret_cast<uint64_t>(addr), &ptr);
-    // if (status != UCS_OK) {
-    //   return FromUcsStatus("ucp_rkey_ptr", status);
-    // }
-
+    // auto buf = fut.get();
+    // std::cout << buf->ToString() << std::endl;
+    BufferVector buf_keep_alive;
     UcxStreamWriter wr(worker->conn_.get());
-    if (buf->ToString() == kCPUData) {
+    if (msg_buf->ToString() == kCPUData) {
       RETURN_NOT_OK(wr.Begin(*sample_record_batch_->schema()));
-      RETURN_NOT_OK(wr.WriteMappedRecordBatch(*sample_record_batch_));
-      // RETURN_NOT_OK(wr.WriteRecordBatch(*sample_record_batch_));
-    } else if (buf->ToString() == kGPUData) {
+      RETURN_NOT_OK(wr.WriteMappedRecordBatch(*sample_record_batch_, &buf_keep_alive));
+      RETURN_NOT_OK(wr.WriteRecordBatch(*sample_record_batch_));
+    } else if (msg_buf->ToString() == kGPUData) {
       RETURN_NOT_OK(wr.Begin(*cuda_record_batch_->schema()));
-      // RETURN_NOT_OK(wr.WriteRecordBatch(*cuda_record_batch_));
-      RETURN_NOT_OK(wr.WriteMappedRecordBatch(*cuda_record_batch_));
+      RETURN_NOT_OK(wr.WriteMappedRecordBatch(*cuda_record_batch_, &buf_keep_alive));
+      RETURN_NOT_OK(wr.WriteRecordBatch(*cuda_record_batch_));
     } else {
       return Status::Invalid("invalid argument");
     }
@@ -815,22 +1303,55 @@ class DataServer : public UcxServer {
     RETURN_NOT_OK(wr.Close());
     std::cout << "num messages sent: " << wr.stats().num_messages << std::endl;
 
+    std::vector<uint64_t> addresses;
+    addresses.resize(buf_keep_alive.size());
+    while (buf_keep_alive.size()) {
+      ucp_tag_recv_info_t info_tag;
+      ucp_tag_message_h msg_tag;
+      while (true) {
+        msg_tag = ucp_tag_probe_nb(worker->worker_->get(), kFreeDataTag, UINT64_MAX, 1,
+                                   &info_tag);
+        if (msg_tag != nullptr)
+          break;
+        else if (ucp_worker_progress(worker->worker_->get()))
+          continue;
+
+        ARROW_RETURN_NOT_OK(
+            FromUcsStatus("ucp_worker_wait", ucp_worker_wait(worker->worker_->get())));
+      }
+
+      ARROW_RETURN_NOT_OK(worker->conn_->RecvTagData(
+          msg_tag, reinterpret_cast<void*>(addresses.data()), info_tag.length, nullptr,
+          nullptr, UCS_MEMORY_TYPE_HOST));
+      size_t count = info_tag.length / sizeof(uint64_t);
+      for (int i = 0; i < count; ++i) {        
+        const uint64_t add = addresses[i];
+        auto it = std::find_if(buf_keep_alive.begin(), buf_keep_alive.end(), [add](const std::shared_ptr<Buffer>& b) -> bool {
+          return static_cast<const uint64_t>(b->address()) == add;
+        });
+        if (it != buf_keep_alive.end()) {
+          buf_keep_alive.erase(it);
+        }
+      }
+    }
+
     return Status::OK();
   }
 
   Status setup_handlers(UcxServer::ClientWorker* worker) override {
-    ucp_am_handler_param_t handler_params;
-    std::memset(&handler_params, 0, sizeof(handler_params));
-    handler_params.field_mask =
-        UCP_AM_HANDLER_PARAM_FIELD_ID | UCP_AM_HANDLER_PARAM_FIELD_CB |
-        UCP_AM_HANDLER_PARAM_FIELD_FLAGS | UCP_AM_HANDLER_PARAM_FIELD_ARG;
-    handler_params.id = kTicketAmHandlerId;
-    handler_params.flags = UCP_AM_FLAG_PERSISTENT_DATA;
-    handler_params.cb = HandleIncomingTicketMessage;
-    handler_params.arg = worker;
+    // ucp_am_handler_param_t handler_params;
+    // std::memset(&handler_params, 0, sizeof(handler_params));
+    // handler_params.field_mask =
+    //     UCP_AM_HANDLER_PARAM_FIELD_ID | UCP_AM_HANDLER_PARAM_FIELD_CB |
+    //     UCP_AM_HANDLER_PARAM_FIELD_FLAGS | UCP_AM_HANDLER_PARAM_FIELD_ARG;
+    // handler_params.id = kTicketAmHandlerId;
+    // handler_params.flags = UCP_AM_FLAG_PERSISTENT_DATA;
+    // handler_params.cb = HandleIncomingTicketMessage;
+    // handler_params.arg = worker;
 
-    auto status = ucp_worker_set_am_recv_handler(worker->worker_->get(), &handler_params);
-    RETURN_NOT_OK(FromUcsStatus("ucp_worker_set_am_recv_handler", status));
+    // auto status = ucp_worker_set_am_recv_handler(worker->worker_->get(),
+    // &handler_params); RETURN_NOT_OK(FromUcsStatus("ucp_worker_set_am_recv_handler",
+    // status));
     return Status::OK();
   }
 
@@ -899,7 +1420,7 @@ class FlightServerWithUCXData : public FlightServerBase {
     }
 
     FlightEndpoint endpoint{{ticket}, {srv.location()}, std::nullopt, {}};
-    
+
     ARROW_ASSIGN_OR_RAISE(
         auto flightinfo,
         FlightInfo::Make(*test_schema, request, {endpoint}, 10, -1, false, meta));
@@ -966,20 +1487,22 @@ Result<std::shared_ptr<RecordBatch>> CopyToHost(const RecordBatch& rb) {
 }  // namespace arrow
 
 DEFINE_int32(port, 31337, "port to listen or connect");
-DEFINE_string(address, "", "address to connect to");
+DEFINE_string(address, "127.0.0.1", "address to connect to");
 DEFINE_bool(gpu, false, "use gpu memory");
 DEFINE_bool(client, false, "run the client");
 
 arrow::Status run_server(const std::string& addr, const int port, const bool use_gpu) {
   const std::string command = use_gpu ? "gpu" : "cpu";
-  auto flight_server = std::make_shared<arrow::flight::FlightServerWithUCXData>("ucx://127.0.0.1:0");
+  auto flight_server =
+      std::make_shared<arrow::flight::FlightServerWithUCXData>("ucx://127.0.0.1:0");
   auto location = *arrow::flight::Location::ForGrpcTcp(addr, port);
   arrow::flight::FlightServerOptions options(location);
 
   RETURN_NOT_OK(flight_server->Init(options));
   RETURN_NOT_OK(flight_server->SetShutdownOnSignals({SIGTERM}));
 
-  std::cout << "Flight Server Listening on " << flight_server->location().ToString() << std::endl;
+  std::cout << "Flight Server Listening on " << flight_server->location().ToString()
+            << std::endl;
 
   return flight_server->Serve();
 }
@@ -989,7 +1512,9 @@ arrow::Status run_client(const std::string& addr, const int port, const bool use
   auto location = *arrow::flight::Location::ForGrpcTcp(addr, port);
   ARROW_ASSIGN_OR_RAISE(auto client, arrow::flight::FlightClient::Connect(location));
 
-  ARROW_ASSIGN_OR_RAISE(auto info, client->GetFlightInfo(arrow::flight::FlightDescriptor::Command(command)));
+  ARROW_ASSIGN_OR_RAISE(
+      auto info,
+      client->GetFlightInfo(arrow::flight::FlightDescriptor::Command(command)));
   std::cout << info->endpoints()[0].locations[0].ToString() << std::endl;
 
   std::shared_ptr<arrow::Device> device = arrow::CPUDevice::Instance();
@@ -1013,6 +1538,7 @@ arrow::Status run_client(const std::string& addr, const int port, const bool use
   arrow::ucx::Requester req{&conn, device};
 
   ARROW_ASSIGN_OR_RAISE(auto rdr, req.GetData(tkt, rkey_buf));
+  RETURN_NOT_OK(rdr->Start(tkt));
   ARROW_ASSIGN_OR_RAISE(auto sc, rdr->GetSchema());
   std::cout << sc->ToString() << std::endl;
 
@@ -1021,7 +1547,13 @@ arrow::Status run_client(const std::string& addr, const int port, const bool use
     ARROW_ASSIGN_OR_RAISE(rec, arrow::cuda::CopyToHost(*rec));
   }
   std::cout << rec->ToString() << std::endl;
-  
+
+  ARROW_ASSIGN_OR_RAISE(rec, rdr->ReadNext());
+  if (command == "gpu") {
+    ARROW_ASSIGN_OR_RAISE(rec, arrow::cuda::CopyToHost(*rec));
+  }
+  std::cout << rec->ToString() << std::endl;
+
   RETURN_NOT_OK(ucx_client.Put(std::move(conn)));
   RETURN_NOT_OK(ucx_client.Close());
   return arrow::Status::OK();
@@ -1031,9 +1563,17 @@ int main(int argc, char** argv) {
   arrow::util::ArrowLog::StartArrowLog("ucxpoc", arrow::util::ArrowLogLevel::ARROW_DEBUG);
 
   gflags::ParseCommandLineFlags(&argc, &argv, true);
-  if (FLAGS_client) {
-    ARROW_CHECK_OK(run_client(FLAGS_address, FLAGS_port, FLAGS_gpu));
-  } else {
-    ARROW_CHECK_OK(run_server(FLAGS_address, FLAGS_port, FLAGS_gpu));
-  }
+  std::thread t1(run_server, FLAGS_address, FLAGS_port, FLAGS_gpu);
+
+  using namespace std::chrono_literals;
+  std::this_thread::sleep_for(2000ms);
+  std::thread t2(run_client, FLAGS_address, FLAGS_port, FLAGS_gpu);
+  t1.join();
+  t2.join();
+
+  // if (FLAGS_client) {
+  //   ARROW_CHECK_OK(run_client(FLAGS_address, FLAGS_port, FLAGS_gpu));
+  // } else {
+  //   ARROW_CHECK_OK(run_server(FLAGS_address, FLAGS_port, FLAGS_gpu));
+  // }
 }
